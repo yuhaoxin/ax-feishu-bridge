@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { RelayClient } from "./relay-client.ts";
+import { relayHelp } from "./feishu-help.ts";
 
-const USAGE = "用法：/feishu relay setup <群chat_id> <你的open_id> | bind [名称] | unbind | status | push <文本>";
 
 export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
   let ctx: ExtensionContext | undefined;
@@ -118,13 +118,15 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     const text = match?.[2] || "";
     if (action === "setup") {
       const parts = text.split(/\s+/);
-      if (parts.length !== 2) throw new Error(USAGE);
+      if (parts.length !== 2) throw new Error(relayHelp());
       await execute("configure", { chatId: parts[0], ownerOpenId: parts[1] }, context);
       context.ui.notify("接力目标及授权账号已配置。", "info");
+    } else if (action === "help") {
+      context.ui.notify(relayHelp(), "info");
     } else if (["bind", "unbind", "status", "push"].includes(action)) {
       const result = await execute(action, { title: text || undefined, text }, context);
       context.ui.notify(formatResult(action, result), "info");
-    } else throw new Error(USAGE);
+    } else throw new Error(relayHelp());
   };
 }
 

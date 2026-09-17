@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { ROOT_DIR } from "../../feishu/config.ts";
 import { RelayGateway } from "./relay-gateway.ts";
 import { registerRelayExtension } from "./relay-extension.ts";
+import { feishuHelp } from "./feishu-help.ts";
 import { BRIDGE_PI_PATH, CHILD_SESSION_ENV, CONFIG_PI_PATH, DAEMON_LOG_PATH, DEBUG_PI_LOG_PATH, DEDUPE_PI_PATH, ensureRoot, loadConfig, mask, removePath, PI_SOURCE, setRuntimeSource, STATE_PI_PATH, writeJson } from "../../feishu/config.ts";
 import { debugLog } from "../../feishu/debug.ts";
 import { FeishuBridgeRuntime } from "../../feishu/bridge-runtime.ts";
@@ -340,7 +341,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
   }
 
   pi.registerCommand("feishu", {
-    description: "飞书：setup | start | stop | restart | status | debug | autostart | reset | tools on|off | relay",
+    description: "飞书：setup | start | stop | restart | status | debug | autostart | reset | tools on|off | relay | help",
     handler: async (args, ctx) => {
       uiRef = ctx.ui as any;
       if (/^relay(?:\s|$)/i.test(args.trim())) {
@@ -353,6 +354,11 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
       const tokens = args.trim().toLowerCase().split(/\s+/, 2);
       const cmd = tokens[0] || "status";
       const cmdArg = tokens[1] || "";
+        if (cmd === "help") {
+          ctx.ui.notify(feishuHelp(), "info");
+          return;
+        }
+
       try {
         if (cmd === "setup") {
           const configToStart = await runSetup(ctx);
@@ -484,7 +490,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
           );
           return;
         }
-        ctx.ui.notify("可用命令：/feishu setup | start | stop | restart | status | debug | autostart | reset | tools on|off | relay", "info");
+        ctx.ui.notify(feishuHelp(), "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
