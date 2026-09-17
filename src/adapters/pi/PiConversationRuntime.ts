@@ -57,10 +57,18 @@ export class PiConversationRuntime implements ConversationRuntime {
   private readonly bridge?: FeishuBridgeRuntime;
   private readonly timeouts: ConversationTimeouts;
 
+  async hasLoadedSession(sessionId: string) {
+    for (const session of this.sessions.values()) {
+      try { if ((await session).sessionId === sessionId) return true; } catch {}
+    }
+    return false;
+  }
+
   constructor(
     cwd: string,
     bridge?: FeishuBridgeRuntime,
     timeouts: ConversationTimeouts = {},
+    private readonly isRelaySession: (sessionId: string) => boolean = () => false,
   ) {
     this.cwd = cwd;
     this.bridge = bridge;
@@ -102,6 +110,7 @@ export class PiConversationRuntime implements ConversationRuntime {
     const next = previous.then(async () => {
       debugLog("feishu.prompt.start", { key, textLength: userText.length, imageCount: images.length });
       const session = await this.ensureSessionFresh(key);
+      if (this.isRelaySession(session.sessionId)) throw new Error("此会话由终端接力管理，请在绑定话题中操作，不能从后台重复执行。");
       const run: ActiveRun = { session, runId: status?.runId, stopped: false, status, onDelta };
       this.activeRuns.set(key, run);
       this.bridge?.beginFeishuInput(session.sessionId);
@@ -292,6 +301,11 @@ export class PiConversationRuntime implements ConversationRuntime {
       const sessionInfo = await this.findSessionInfo(sessionPath);
       if (!sessionInfo) {
         await onReply("这条历史会话不存在，可能已经被删除。请重新打开 /resume 选择。");
+        return;
+      }
+
+      if (this.isRelaySession(sessionInfo.id)) {
+        await onReply("此会话由终端接力管理，请在绑定话题中操作。");
         return;
       }
 

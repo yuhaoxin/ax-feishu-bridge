@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { FeishuCardAction, FeishuConfig, FeishuMessage } from "./types.ts";
 import { loadConfig } from "./config.ts";
 import { debugLog } from "./debug.ts";
@@ -48,6 +49,7 @@ export class FeishuTransport {
     config: FeishuConfig,
     onMessage: (msg: FeishuMessage) => Promise<void>,
     onCardAction: (action: FeishuCardAction) => Promise<object | undefined | void>,
+    private readonly onRelayMessage?: (msg: FeishuMessage) => Promise<boolean>,
   ) {
     this.config = config;
     this.onMessage = onMessage;
@@ -172,6 +174,20 @@ export class FeishuTransport {
       hasThreadId: Boolean(message.thread_id),
       content: message.content || "",
     });
+
+    // 接力话题先独立校验权限和在线状态，不受普通群聊触发策略影响。
+    if (this.onRelayMessage && await this.onRelayMessage({
+      messageId: message.message_id,
+      chatId: message.chat_id,
+      chatType: message.chat_type,
+      senderOpenId: sender?.sender_id?.open_id || "unknown",
+      msgType: message.message_type,
+      content: message.content || "",
+      rootId: message.root_id,
+      parentId: message.parent_id,
+      threadId: message.thread_id,
+      mentions: message.mentions,
+    })) return;
 
     if (message.chat_type === "group") {
       const text = extractPlainTextForTrigger(message.message_type || "text", message.content || "");
@@ -375,6 +391,51 @@ export class FeishuTransport {
       path: { message_id: messageId },
       data: { content: JSON.stringify({ text: chunk }) },
     }));
+  }
+
+  async verifyTopicChat(chatId: string, ownerOpenId: string) {
+    const result = await this.sdkClient.im.v1.chat.get({ path: { chat_id: chatId }, params: { user_id_type: "open_id" } });
+    const data = this.relayResult(result);
+    if (data.group_message_type !== "thread") throw new Error("接力目标必须是飞书话题群。");
+    if (data.owner_id !== ownerOpenId) throw new Error("接力授权账号必须是该话题群的群主，请核对你的 open_id。");
+  }
+
+  async createRelayTopic(chatId: string, title: string) {
+    const result = await this.sdkClient.im.message.create({
+      params: { receive_id_type: "chat_id" },
+      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: `${title}\nPi 会话接力已建立。` }), uuid: randomUUID() },
+    });
+    const data = this.relayResult(result);
+    if (!data.message_id || !data.thread_id) throw new Error("飞书未返回完整话题标识，话题可能已创建但未绑定；请检查飞书后再操作。");
+    this.rememberBotOutboundMessageId(data.message_id);
+    return { threadId: String(data.thread_id), rootMessageId: String(data.message_id) };
+  }
+
+  async replyRelayText(rootMessageId: string, text: string) {
+    for (const chunk of splitText(text, 16 * 1024)) {
+      const result = await this.sdkClient.im.message.reply({
+        path: { message_id: rootMessageId },
+        data: { msg_type: "text", content: JSON.stringify({ text: chunk }), reply_in_thread: true, uuid: randomUUID() },
+      });
+      this.relayResult(result);
+    }
+  }
+
+  async replyRelayCard(rootMessageId: string, card: object): Promise<string> {
+    const result = await this.sdkClient.im.message.reply({
+      path: { message_id: rootMessageId },
+      data: { msg_type: "interactive", content: JSON.stringify(card), reply_in_thread: true, uuid: randomUUID() },
+    });
+    const data = this.relayResult(result);
+    if (!data.message_id) throw new Error("飞书未返回消息标识，投递结果未确认；请检查飞书。");
+    this.rememberBotOutboundMessageId(data.message_id);
+    return String(data.message_id);
+  }
+
+  private relayResult(result: any) {
+    // POST 请求失败时不自动重放；HTTP 成功也可能包含飞书业务错误码。
+    if (result?.code !== 0 || !result?.data) throw new Error(`飞书接力请求未确认成功（错误码 ${result?.code ?? "未知"}），请检查飞书后再操作。`);
+    return result.data;
   }
 
   async sendText(chatId: string, text: string) {

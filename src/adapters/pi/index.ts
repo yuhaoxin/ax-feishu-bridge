@@ -4,6 +4,10 @@ import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { join } from "node:path";
+import { ROOT_DIR } from "../../feishu/config.ts";
+import { RelayGateway } from "./relay-gateway.ts";
+import { registerRelayExtension } from "./relay-extension.ts";
 import { BRIDGE_PI_PATH, CHILD_SESSION_ENV, CONFIG_PI_PATH, DAEMON_LOG_PATH, DEBUG_PI_LOG_PATH, DEDUPE_PI_PATH, ensureRoot, loadConfig, mask, removePath, PI_SOURCE, setRuntimeSource, STATE_PI_PATH, writeJson } from "../../feishu/config.ts";
 import { debugLog } from "../../feishu/debug.ts";
 import { FeishuBridgeRuntime } from "../../feishu/bridge-runtime.ts";
@@ -41,6 +45,9 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
 
   // 模型可读写白名单配置（热更新 + 落盘）
   registerFeishuConfigTools(pi);
+  const relayEndpointPath = join(ROOT_DIR, "relay-endpoint.pi.json");
+  const relayCommand = process.env.PI_FEISHU_DAEMON === "1" ? undefined : registerRelayExtension(pi, relayEndpointPath);
+  let relay: RelayGateway | undefined;
 
   // 注意：不要在这里调用 hideFeishuConfigTools(pi)。getActiveTools()/setActiveTools()
   // 是会话级 API，在扩展加载期（session_start 之前）调用会抛错，导致后续
@@ -55,7 +62,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
   const conversations = new PiConversationRuntime(process.cwd(), bridge, {
     promptNotifySec: initialConfig?.promptNotifySec,
     promptTimeoutSec: initialConfig?.promptTimeoutSec,
-  });
+  }, (sessionId) => relay?.protectsSession(sessionId) ?? true);
   const messageHandler = new FeishuMessageHandler(conversations, () => transport, bridgeStore);
 
   const STATUS_KEY = "feishu-connection";
@@ -161,6 +168,8 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
     }
     gatewayLock = lockResult.handle;
     gatewayLock.setOnLost(async () => {
+      await relay?.stop();
+      relay = undefined;
       await transport?.stop();
       transport = undefined;
       gatewayLock = undefined;
@@ -170,14 +179,22 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
         process.exit(0);
       }
     });
-    transport = new FeishuTransport(cfg, (msg) => messageHandler.handle(msg), createCardActionHandler(conversations, () => transport));
+    transport = new FeishuTransport(cfg, (msg) => messageHandler.handle(msg), createCardActionHandler(conversations, () => transport), async (msg) => {
+      if (!relay) throw new Error("接力网关尚未就绪，拒绝分派消息。");
+      return relay.handleMessage(msg);
+    });
     try {
+      relay = new RelayGateway(join(ROOT_DIR, "relay-state.pi.json"), relayEndpointPath, cfg.appId, transport, (id) => conversations.hasLoadedSession(id));
+      await relay.start();
       await transport.start();
       gatewayLock.startHeartbeat();
       await gatewayLock.update("connected");
       updateStatus("connected");
       return "started";
     } catch (error) {
+      await relay?.stop();
+      relay = undefined;
+      await transport?.stop();
       updateStatus(error instanceof BotUnavailableError ? "bot unavailable" : "disconnected");
       await gatewayLock.release();
       gatewayLock = undefined;
@@ -187,6 +204,8 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
   }
 
   async function stop() {
+    await relay?.stop();
+    relay = undefined;
     await transport?.stop();
     transport = undefined;
     await gatewayLock?.release();
@@ -321,9 +340,16 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
   }
 
   pi.registerCommand("feishu", {
-    description: "Feishu/Lark: setup, start, stop, restart, status, debug, autostart, reset, tools on|off",
+    description: "飞书：setup | start | stop | restart | status | debug | autostart | reset | tools on|off | relay",
     handler: async (args, ctx) => {
       uiRef = ctx.ui as any;
+      if (/^relay(?:\s|$)/i.test(args.trim())) {
+        try {
+          if (!relayCommand) throw new Error("请在 Pi TUI 中执行接力命令。");
+          await relayCommand(args.trim().replace(/^relay\s*/i, ""), ctx);
+        } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
+        return;
+      }
       const tokens = args.trim().toLowerCase().split(/\s+/, 2);
       const cmd = tokens[0] || "status";
       const cmdArg = tokens[1] || "";
@@ -458,7 +484,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
           );
           return;
         }
-        ctx.ui.notify("可用命令：/feishu setup | start | stop | restart | status | debug | autostart | reset | tools on|off", "info");
+        ctx.ui.notify("可用命令：/feishu setup | start | stop | restart | status | debug | autostart | reset | tools on|off | relay", "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
