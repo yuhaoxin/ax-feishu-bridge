@@ -12,6 +12,7 @@ import type { FeishuMessage } from "../src/feishu/types.ts";
 
 export function fakeTransport() {
   const topics: string[] = [];
+  const renames: Array<{ root: string; title: string }> = [];
   const text: Array<{ root: string; text: string }> = [];
   const cards: Array<{ root: string; card: any }> = [];
   const transport: RelayTransport = {
@@ -22,8 +23,9 @@ export function fakeTransport() {
     },
     async replyRelayText(root, value) { text.push({ root, text: value }); },
     async replyRelayCard(root, card) { cards.push({ root, card }); return `om_card${cards.length}`; },
+    async renameRelayTitle(root, title) { renames.push({ root, title }); },
   };
-  return { topics, text, cards, transport };
+  return { topics, renames, text, cards, transport };
 }
 
 function incoming(threadId: string, messageId: string, senderOpenId = "ou_owner"): FeishuMessage {
@@ -49,15 +51,20 @@ async function fixture(t: any) {
   return { ...fake, gateway, state, endpoint, client, a };
 }
 
-test("接力：两个真实 TCP 客户端独立绑定，授权、去重及忙时回执", async (t) => {
+test("接力：两个真实 TCP 客户端独立自动绑定，授权、去重及忙时回执", async (t) => {
   const f = await fixture(t);
-  const a = await f.a.request("bind", { title: "会话 A" });
+  const first = await f.a.request("autobindTopic", { title: "会话 A" });
+  assert.equal(first.created, true);
+  const bindingA = first.binding;
   const inputs: any[] = [];
   const b = f.client("session-b", async (method, params) => { inputs.push({ method, params }); return { accepted: true, busy: true }; });
-  const binding = await b.request("bind", { title: "会话 B" });
-  assert.notEqual(a.threadId, binding.threadId);
-  assert.equal((await b.request("bind", { title: "会话 B" })).threadId, binding.threadId);
-  await assert.rejects(b.request("bind", { title: "不会新建" }), /已绑定/);
+  await b.request("configure", { chatId: "oc_test", ownerOpenId: "ou_owner" });
+  const second = await b.request("autobindTopic", { title: "会话 B" });
+  const binding = second.binding;
+  assert.notEqual(bindingA.threadId, binding.threadId);
+  // 已绑定后重复自动绑定幂等，不新建话题
+  const again = await b.request("autobindTopic", { title: "会话 B" });
+  assert.equal(again.binding.threadId, binding.threadId);
   assert.equal(f.topics.length, 2);
   assert.equal(await f.gateway.handleMessage(incoming(binding.threadId, "unauthorized", "ou_stranger")), true);
   assert.equal(inputs.length, 0);
@@ -72,33 +79,34 @@ test("接力：两个真实 TCP 客户端独立绑定，授权、去重及忙时
   assert.equal(statSync(f.state).mode & 0o777, 0o600);
 });
 
-test("接力：解绑后换名创建新话题，旧话题继续拦截，状态指向新绑定", async (t) => {
+test("接力：开关关闭 / 退出名单 / 改名同步", async (t) => {
   const f = await fixture(t);
-  const first = await f.a.request("bind", { title: "旧名" });
+  // 全局关闭：不创建话题
+  await f.a.request("autobind", { enabled: false });
+  assert.equal((await f.a.request("autobindTopic", { title: "X" })).created, false);
+  await f.a.request("autobind", { enabled: true });
+  const created = await f.a.request("autobindTopic", { title: "来自终端" });
+  assert.equal(created.created, true);
+  const binding = created.binding;
+  assert.match(binding.title, /来自终端 \[session-/);
+  // 会话名变化：patch 根消息改名，话题不变
+  await f.a.request("rename", { title: "新会话名" });
+  assert.equal(f.renames.at(-1)!.root, binding.rootMessageId);
+  assert.equal((await f.a.request("status")).title, "新会话名 [session-]");
+  // unbind：解绑并进退出名单；旧话题继续拦截
   await f.a.request("unbind");
-  const second = await f.a.request("bind", { title: "新名" });
-  assert.notEqual(second.threadId, first.threadId);
-  assert.equal((await f.a.request("status")).title, second.title);
-  assert.equal(f.topics.length, 2);
-  await f.gateway.handleMessage(incoming(first.threadId, "old-topic"));
+  await f.gateway.handleMessage(incoming(binding.threadId, "after-unbind"));
   assert.match(f.text.at(-1)!.text, /解绑/);
-  const before = f.text.length;
-  await f.gateway.handleMessage(incoming(second.threadId, "new-topic"));
-  assert.equal(f.text.length, before, "新话题正常送达时不产生拒绝提示");
-  // 同名重绑仍复用，不产生第三条话题
-  await f.a.request("unbind");
-  const reused = await f.a.request("bind", { title: "新名" });
-  assert.equal(reused.threadId, second.threadId);
-  assert.equal(f.topics.length, 2);
+  assert.equal((await f.a.request("autobindTopic", { title: "想回来" })).created, false);
+  assert.equal(f.topics.length, 1);
+  const state = JSON.parse(readFileSync(f.state, "utf8"));
+  assert.ok(state.optOut.includes("session-a"));
 });
 
-test("接力：离线、解绑拒绝，不回落后台，不在重连后重放", async (t) => {
+test("接力：离线拒绝，不回落后台，不在重连后重放", async (t) => {
   const f = await fixture(t);
-  const binding = await f.a.request("bind", { title: "A" });
-  await f.a.request("unbind");
-  await f.gateway.handleMessage(incoming(binding.threadId, "unbound"));
-  assert.match(f.text.at(-1)!.text, /解绑/);
-  await f.a.request("bind", { title: "A" });
+  const created = await f.a.request("autobindTopic", { title: "A" });
+  const binding = created.binding;
   f.a.close();
   // status 请求提供一个事件循环屏障，确保服务端已处理断开。
   const observer = f.client("observer");
@@ -131,16 +139,17 @@ test("接力：收讫前断联提示不确定，不能自动重试", async (t) =
   const f = await fixture(t);
   let calls = 0;
   const b = f.client("b", async () => { calls++; b.close(); return { accepted: true }; });
-  const binding = await b.request("bind", { title: "B" });
-  await f.gateway.handleMessage(incoming(binding.threadId, "uncertain"));
+  const created = await b.request("autobindTopic", { title: "B" });
+  await f.gateway.handleMessage(incoming(created.binding.threadId, "uncertain"));
   assert.match(f.text.at(-1)!.text, /未确认/);
-  await f.gateway.handleMessage(incoming(binding.threadId, "uncertain"));
+  await f.gateway.handleMessage(incoming(created.binding.threadId, "uncertain"));
   assert.equal(calls, 1);
 });
 
 test("接力：正式答案只发一次，长内容分块且保持同一话题", async (t) => {
   const f = await fixture(t);
-  const binding = await f.a.request("bind", { title: "A" });
+  const created = await f.a.request("autobindTopic", { title: "A" });
+  const binding = created.binding;
   const answer = "正式回复".repeat(4000);
   await f.a.output({ id: "turn-1", text: answer });
   assert.equal(f.cards.map((c) => c.card.elements[0].content).join(""), answer);
@@ -151,21 +160,22 @@ test("接力：正式答案只发一次，长内容分块且保持同一话题",
   await f.a.request("push", { text: "主动通知" });
   assert.equal(f.text.at(-1)!.text, "主动通知");
 });
+
 test("接力：话题创建超时后持久阻断重试及普通后台回落", async (t) => {
   const f = await fixture(t);
   let creates = 0;
   f.transport.createRelayTopic = async () => { creates++; throw new Error("远端创建结果未确认"); };
-  await assert.rejects(f.a.request("bind", { title: "不确定话题" }), /未确认/);
-  await assert.rejects(f.a.request("bind", { title: "再次尝试" }), /暂停创建/);
+  await assert.rejects(f.a.request("autobindTopic", { title: "不确定话题" }), /未确认/);
+  await assert.rejects(f.a.request("autobindTopic", { title: "再次尝试" }), /暂停创建/);
   assert.equal(creates, 1);
   assert.equal(await f.gateway.handleMessage(incoming("omt_unknown", "orphan")), true);
   assert.equal(JSON.parse(readFileSync(f.state, "utf8")).pendingTopic.sessionId, "session-a");
 });
 
-
 test("接力：网关重启恢复路由和收讫记录，不恢复旧连接", async (t) => {
   const f = await fixture(t);
-  const binding = await f.a.request("bind", { title: "A" });
+  const created = await f.a.request("autobindTopic", { title: "A" });
+  const binding = created.binding;
   await f.gateway.handleMessage(incoming(binding.threadId, "before-restart"));
   await f.gateway.stop();
   const next = new RelayGateway(f.state, f.endpoint, "app_test", f.transport);

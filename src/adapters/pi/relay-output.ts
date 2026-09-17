@@ -12,6 +12,7 @@ export type RelayTransport = {
   createRelayTopic(chatId: string, title: string): Promise<{ threadId: string; rootMessageId: string }>;
   replyRelayText(rootMessageId: string, text: string): Promise<void>;
   replyRelayCard(rootMessageId: string, card: object): Promise<string>;
+  renameRelayTitle(rootMessageId: string, title: string): Promise<void>;
 };
 
 /** 正式回复按 Unicode 字符分块，保留完整文本并避免超出飞书卡片大小限制。 */

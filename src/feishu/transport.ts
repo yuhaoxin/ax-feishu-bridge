@@ -437,6 +437,15 @@ export class FeishuTransport {
     if (result?.code !== 0 || !result?.data) throw new Error(`飞书接力请求未确认成功（错误码 ${result?.code ?? "未知"}），请检查飞书后再操作。`);
     return result.data;
   }
+  async renameRelayTitle(rootMessageId: string, title: string) {
+    // 话题标题即根消息内容的展示：patch 根消息 = 原话题改名，thread_id 不变。
+    const result = await this.sdkClient.im.v1.message.patch({
+      path: { message_id: rootMessageId },
+      data: { content: JSON.stringify({ text: `${title}\nPi 会话接力已建立。` }) },
+    });
+    this.relayResult(result);
+  }
+
 
   async sendText(chatId: string, text: string) {
     const mode = chooseMessageMode(text);

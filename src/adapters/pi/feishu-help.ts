@@ -17,12 +17,12 @@ export function feishuHelp(): string {
     "  /feishu tools on|off                显示/隐藏 feishu_config_* 工具（仅当前会话）",
     "  /feishu tools                       查看配置工具当前是否启用",
     "",
-    "会话接力（详见 docs/pi-session-relay.md）",
+    "会话接力（新会话自动建话题；详见 docs/pi-session-relay.md）",
     "  /feishu relay setup <群chat_id> <你的open_id>   一次性配置接力目标话题群与授权账号（须为群主的 open_id）",
-    "  /feishu relay bind [名称]           把当前 TUI 会话绑定为独立飞书话题；同名重绑复用原话题，换名创建新话题",
+    "  /feishu relay autobind on|off       开关「新会话自动绑定话题」（默认开）；关闭时新会话不再建话题",
     "  /feishu relay status                查看当前会话的绑定状态",
     "  /feishu relay push <文本>           向当前会话的绑定话题主动推送一条消息",
-    "  /feishu relay unbind                解绑当前会话（不删除历史与话题）",
+    "  /feishu relay unbind                解绑当前会话并永久退出自动绑定（不删历史与话题）",
     "  /feishu relay help                  显示接力命令说明",
     "",
     "  /feishu help                        显示本说明",
@@ -35,9 +35,9 @@ export function relayHelp(): string {
     "飞书会话接力用法（只能操作当前 TUI 会话；目标群与授权账号由 setup 一次性锁定）：",
     "",
     "  /feishu relay setup <群chat_id> <你的open_id>   配置目标话题群与授权账号；执行一次即可",
-    "  /feishu relay bind [名称]           绑定当前会话为新话题（默认用 Pi 会话名）；同名重绑复用原话题，换名创建新话题",
+    "  /feishu relay autobind on|off       开关「新会话自动绑定话题」；默认开",
     "  /feishu relay status                查看当前会话绑定状态",
     "  /feishu relay push <文本>           向当前会话的绑定话题主动推送一条消息（最多 100000 字符）",
-    "  /feishu relay unbind                解绑当前会话；旧话题继续拒绝执行，重新绑定复用原话题",
+    "  /feishu relay unbind                解绑当前会话并永久退出自动绑定；旧话题继续拒绝执行"
   ].join("\n");
 }

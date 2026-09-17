@@ -10,10 +10,12 @@ import { sendRelayAnswer, type RelayBinding, type RelayTransport } from "./relay
 export type RelayState = {
   version: 1;
   appId: string;
-  settings?: { chatId: string; ownerOpenId: string };
+  settings?: { chatId: string; ownerOpenId: string; autobind?: boolean };
   pendingTopic?: { sessionId: string; title: string };
   bindings: RelayBinding[];
   receipts: Record<string, number>;
+  /** 主动退出接力的会话：不再自动绑定；旧话题记录保留以持续拦截。 */
+  optOut: string[];
 };
 
 export function writeRelayJson(path: string, value: unknown) {
@@ -39,10 +41,10 @@ export class RelayGateway {
     private readonly transport: RelayTransport,
     private readonly isBackendSession: (sessionId: string) => Promise<boolean> = async () => false,
   ) {
-    this.state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { version: 1, appId, bindings: [], receipts: {} };
-    if (this.state.version !== 1 || this.state.appId !== appId || !Array.isArray(this.state.bindings) || !this.state.receipts) {
+    this.state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { version: 1, appId, bindings: [], receipts: {}, optOut: [] };
+    if (!Array.isArray(this.state.optOut)) this.state.optOut = [];
+    if (this.state.version !== 1 || this.state.appId !== appId || !Array.isArray(this.state.bindings) || !this.state.receipts)
       throw new Error("接力状态无效或属于其他机器人，请检查接力状态文件。");
-    }
     for (const binding of this.state.bindings) {
       if (![binding.sessionId, binding.chatId, binding.threadId, binding.rootMessageId, binding.title].every((s) => typeof s === "string" && s.length) || typeof binding.enabled !== "boolean") {
         throw new Error("接力绑定数据损坏；为避免消息进入错误会话，已停止接力服务。");
@@ -170,17 +172,19 @@ export class RelayGateway {
       return { configured: true };
     }
     const binding = this.binding(sessionId);
-    if (method === "bind") {
-      const title = `${requireString(params?.title, 80)} [${sessionId.slice(0, 8)}]`;
-      if (binding?.title === title) {
-        // 同名重绑（含解绑后）：复用原话题，不重复创建。
-        binding.enabled = true;
-        this.save();
-        return binding;
-      }
-      if (binding?.enabled) throw new Error(`当前会话已绑定「${binding.title}」；如需更换话题请先 /feishu relay unbind。`);
+    if (method === "autobind") {
       if (!this.state.settings) throw new Error("请先在终端执行 /feishu relay setup <群chat_id> <你的open_id>。");
-      if (this.state.pendingTopic) throw new Error("上次话题创建结果未确认，已暂停创建及目标群的普通会话分派。请检查飞书并联系维护者处理 relay-state.pi.json 中的 pendingTopic，不要反复重试。");
+      this.state.settings.autobind = Boolean(params?.enabled);
+      this.save();
+      return { autobind: this.state.settings.autobind };
+    }
+    if (method === "autobindTopic") {
+      if (!this.state.settings) return { created: false, reason: "unconfigured" };
+      if (this.state.settings.autobind === false) return { created: false, reason: "disabled" };
+      if (binding?.enabled) return { created: true, binding };
+      if (this.state.optOut.includes(sessionId)) return { created: false, reason: "opted-out" };
+      if (this.state.pendingTopic) throw new Error("上次话题创建结果未确认，已暂停创建及目标群的普通会话分派。请检查 relay-state.pi.json 中的 pendingTopic，不要反复重试。");
+      const title = `${requireString(params?.title, 120)} [${sessionId.slice(0, 8)}]`;
       const { chatId } = this.state.settings;
       this.state.pendingTopic = { sessionId, title };
       this.save();
@@ -190,14 +194,27 @@ export class RelayGateway {
       delete next.pendingTopic;
       writeRelayJson(this.statePath, next);
       this.state = next;
-      return created;
+      return { created: true, binding: created };
     }
-    if (!binding?.enabled) throw new Error("请先绑定当前会话。");
-    if (method === "unbind") {
-      binding.enabled = false;
+    if (method === "rename") {
+      if (!binding?.enabled) throw new Error("当前会话尚未绑定，没有可改名的话题。");
+      const title = `${requireString(params?.title, 120)} [${sessionId.slice(0, 8)}]`;
+      if (title === binding.title) return binding;
+      await this.transport.renameRelayTitle(binding.rootMessageId, title);
+      binding.title = title;
       this.save();
       return binding;
     }
+    if (method === "unbind") {
+      // unbind 即本会话永久退出接力：不再自动绑定；旧话题记录保留并继续拦截。
+      if (binding?.enabled) { binding.enabled = false; }
+      if (!this.state.optOut.includes(sessionId)) {
+        this.state.optOut.push(sessionId);
+      }
+      this.save();
+      return binding || { unbound: true };
+    }
+    if (!binding?.enabled) throw new Error("当前会话没有启用的绑定话题。");
     if (method === "push") {
       await this.transport.replyRelayText(binding.rootMessageId, requireString(params?.text, 100_000));
       return { delivered: true };

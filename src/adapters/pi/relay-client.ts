@@ -59,7 +59,8 @@ export class RelayClient {
     await this.connect();
     if (!this.peer?.connected) throw new Error("当前接力连接已离线。");
     const result = await this.peer.request(method, params);
-    if (["bind", "unbind", "status", "ping"].includes(method)) this.binding = result;
+    if (["unbind", "status", "ping", "rename"].includes(method)) this.binding = result;
+    else if (method === "autobindTopic" && result?.created) this.binding = result.binding;
     return result;
   }
 

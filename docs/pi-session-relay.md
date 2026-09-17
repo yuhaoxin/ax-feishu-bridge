@@ -25,10 +25,9 @@ pi install git:github.com/yuhaoxin/ax-feishu-bridge@feat/feishu-session-handoff
 ```text
 /feishu start
 /feishu relay setup oc_目标话题群 ou_你的账号
-/feishu relay bind 会话名称
 ```
 
-`setup` 读取群信息验证话题群及群主，不发送消息。`bind` 创建话题并发送一条连接说明；同名重绑复用原话题，换名创建新话题。标题由指定名称（默认 Pi 会话名）和会话短 ID 构成，不自动包含工作区完整路径或会话历史。
+`setup` 读取群信息验证话题群及群主，不发送消息，并开启「新会话自动绑定」（默认开，可用 `/feishu relay autobind on|off` 切换）。此后每个新开的 Pi TUI 会话在发出第一条用户消息时自动创建一个独立话题；标题取「Pi 会话名 ‖ 首条用户消息前 30 字 ‖ 工作目录 basename」加会话短 ID。之后在 Pi 里修改会话名（`session_info_changed`）会自动更新话题标题；名字清空则保持不变。没有实际使用的会话不会创建话题。
 
 接力配置只可通过终端命令设置，模型工具不能改变群或授权账号。已有话题后不允许更换目标群或账号，避免旧话题和权限发生歧义。
 
@@ -40,7 +39,7 @@ pi install git:github.com/yuhaoxin/ax-feishu-bridge@feat/feishu-session-handoff
 /feishu relay unbind
 ```
 
-模型可调用 `feishu_relay` 工具的 `bind`、`status`、`push`、`unbind` 操作。绑定和显式推送应由用户明确要求。工具没有任意收件人参数，仅操作当前会话。
+模型可调用 `feishu_relay` 工具的 `status`、`push`、`unbind`、`autobind` 操作。显式推送应由用户明确要求。工具没有任意收件人参数，仅操作当前会话，也不能改变群或授权账号。
 
 - 在绑定话题回复文本即可继续操作对应终端，无需在多个会话间执行 `/resume`。
 - TUI 忙时使用 Pi 的 `steer` 队列，在工具执行边界引导当前任务，不强制中止运行中的工具。
@@ -48,7 +47,7 @@ pi install git:github.com/yuhaoxin/ax-feishu-bridge@feat/feishu-session-handoff
 - 同一会话重新打开后自动恢复连接和绑定。断线期间的输出不自动补发，需要时显式推送。
 - 同一会话不能由两个 TUI 接力连接同时占用。已由普通飞书后台加载的会话不能接力注册；先在飞书切换到新会话并重启网关。
 - 接力管理的会话不能再从普通飞书 `/resume` 路径驱动后台模型，避免两处写入同一历史。
-- 解绑不删除历史、话题和路由记录，旧话题继续拒绝执行。解绑后重新绑定同名复用原话题；换新名称会创建新话题，状态指向新绑定。
+- `unbind` = 本会话永久退出接力：解绑并记入退出名单，此后 `session_start` 不再自动绑定；旧话题继续拒绝执行。退出后想恢复只能删除会话重新打开（新会话 ID 会自动绑定）。`autobind off` 是全局开关，关闭后新会话都不建话题，已绑定的会话不受影响。
 - 接力话题目前只接收文本（含纯文本富文本消息），不下载图片、文件或展开引用附件。斜杠命令作为普通输入送入 Pi，不执行飞书的 `/resume` 等后台管理命令。
 - 普通、未绑定的飞书会话保持原有后台聊天行为；本功能的单账号限制只保护接力话题，不改变其他会话的访问策略。
 

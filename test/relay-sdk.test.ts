@@ -70,7 +70,8 @@ test("接力端到端：飞书输入写入真实 Pi 会话并触发回答，订�
     rmSync(dir, { recursive: true, force: true });
   });
   await command("setup oc_test ou_owner", context);
-  await command("bind SDK 验收", context);
+  // 自动绑定：session_start（startup）标记待绑定，首条用户 input 触发 autobindTopic
+  await session.extensionRunner!.emit({ type: "input", text: "SDK 验收工作", source: "user" } as any);
   await gateway.handleMessage({ chatId: "oc_test", chatType: "group", threadId: "omt_test", messageId: "om_in", senderOpenId: "ou_owner", msgType: "text", content: JSON.stringify({ text: "来自飞书的真实输入" }) });
   for (let i = 0; i < 200 && !events.some((e) => e.type === "message_update"); i++) await delay(10);
   assert.ok(events.some((e) => e.type === "message_end" && e.message.role === "user"));
