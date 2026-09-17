@@ -5,6 +5,7 @@
     "allowImportingTsExtensions": false,
     "rewriteRelativeImportExtensions": true,
     "outDir": "lib",
+    "rootDir": "src",
     "declaration": false,
     "sourceMap": false
   },
