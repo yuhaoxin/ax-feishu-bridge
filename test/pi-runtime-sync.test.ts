@@ -3,13 +3,15 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PiConversationRuntime } from "../src/adapters/pi/PiConversationRuntime.ts";
-import { readJson, STATE_PI_PATH, writeJson } from "../src/feishu/config.ts";
+
+// 必须在导入前设置 HOME：STATE_PI_PATH 等路径在模块加载时基于它计算，
+// 运行时再改 HOME 不会改变已定型的路径，会把测试写入真实 ~/.pi/agent/feishu/。
+const homeDir = mkdtempSync(join(tmpdir(), "feishu-pi-test-"));
+process.env.HOME = homeDir;
+const { PiConversationRuntime } = await import("../src/adapters/pi/PiConversationRuntime.ts");
+const { readJson, STATE_PI_PATH, writeJson } = await import("../src/feishu/config.ts");
 
 test("pi runtime: ensures session file stats are tracked and hot-reloaded on external modifications", async () => {
-  const homeDir = mkdtempSync(join(tmpdir(), "feishu-pi-test-"));
-  const previousHome = process.env.HOME;
-  process.env.HOME = homeDir;
   try {
     const wsDir = join(homeDir, "ws");
     const runtime = new PiConversationRuntime(wsDir);
@@ -78,8 +80,6 @@ test("pi runtime: ensures session file stats are tracked and hot-reloaded on ext
     assert.equal(createdNew, false, "should not reload again if file unchanged");
     assert.equal(sameSession.sessionId, "s2");
   } finally {
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
     rmSync(homeDir, { recursive: true, force: true });
   }
 });

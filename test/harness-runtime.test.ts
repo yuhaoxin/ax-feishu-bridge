@@ -8,9 +8,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HarnessConversationRuntime, isToolCallText, summarizeAssistantText } from "../src/adapters/harness/HarnessConversationRuntime.ts";
-import { readJson, STATE_HARNESS_PATH, writeJson } from "../src/feishu/config.ts";
 
+// 必须在导入前设置 HOME/DSH_HOME：STATE_HARNESS_PATH、HARNESS_ROOT 等路径在模块加载时定型，
+// 运行时再改环境变量不会改变已定型的路径，会把测试写入真实 ~/.dsh 或 ~/.pi/agent/。
+const isolatedHome = mkdtempSync(join(tmpdir(), "feishu-harness-root-"));
+process.env.HOME = isolatedHome;
+process.env.DSH_HOME = join(isolatedHome, "dsh");
+const { HarnessConversationRuntime, isToolCallText, summarizeAssistantText } = await import("../src/adapters/harness/HarnessConversationRuntime.ts");
+const { readJson, STATE_HARNESS_PATH, writeJson } = await import("../src/feishu/config.ts");
 function createMockCtx() {
   const listeners: Array<[string, (...args: any[]) => void]> = [];
   const ctx: any = {

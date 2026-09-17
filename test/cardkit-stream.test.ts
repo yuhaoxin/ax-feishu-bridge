@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { CardKitStream } from "../src/feishu/cardkit-stream.ts";
+
+// 必须在导入前设置 HOME：debugLog 的落盘路径在模块加载时基于它计算，
+// 否则 CardKitStream 的调试日志会写入真实 ~/.pi/agent/feishu/debug.pi.log。
+const { mkdtempSync, rmSync } = await import("node:fs");
+const { tmpdir } = await import("node:os");
+const { join } = await import("node:path");
+const homeDir = mkdtempSync(join(tmpdir(), "feishu-cardkit-test-"));
+process.env.HOME = homeDir;
+const { CardKitStream } = await import("../src/feishu/cardkit-stream.ts");
 
 test("CardKit creates a reply-in-progress card before the first text delta", async () => {
   const originalFetch = globalThis.fetch;
@@ -52,5 +60,6 @@ test("CardKit creates a reply-in-progress card before the first text delta", asy
     await stream.close();
   } finally {
     globalThis.fetch = originalFetch;
+    rmSync(homeDir, { recursive: true, force: true });
   }
 });

@@ -9,12 +9,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireGatewayLock } from "../src/feishu/gateway-lock.ts";
+
+// 必须在导入前设置 HOME：LOCKS_PATH 在模块加载时基于它计算，
+// 运行时再改 HOME 不会改变已定型的路径，会把测试写入真实 ~/.pi/agent/locks.json。
+const homeDir = mkdtempSync(join(tmpdir(), "feishu-lock-test-"));
+process.env.HOME = homeDir;
+const { acquireGatewayLock, gatewayLockPath } = await import("../src/feishu/gateway-lock.ts");
 
 test("gateway lock is per-appId: different bots can hold locks in parallel", async () => {
-  const homeDir = mkdtempSync(join(tmpdir(), "feishu-lock-test-"));
-  const previousHome = process.env.HOME;
-  process.env.HOME = homeDir;
   try {
     const botA = await acquireGatewayLock("/tmp/ws", false, "app-bot-a");
     assert.equal(botA.status, "acquired");
@@ -24,29 +26,23 @@ test("gateway lock is per-appId: different bots can hold locks in parallel", asy
     await botA.handle.release();
     await botB.handle.release();
   } finally {
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
     rmSync(homeDir, { recursive: true, force: true });
   }
 });
 
 test("gateway lock is per-appId: same bot stays exclusive", async () => {
-  const homeDir = mkdtempSync(join(tmpdir(), "feishu-lock-test-"));
-  const previousHome = process.env.HOME;
-  process.env.HOME = homeDir;
-  try {
-    const first = await acquireGatewayLock("/tmp/ws", false, "app-bot-a");
-    assert.equal(first.status, "acquired");
-    const second = await acquireGatewayLock("/tmp/ws", false, "app-bot-a");
-    assert.equal(second.status, "busy", "same bot must not connect twice");
+  const botA = await acquireGatewayLock("/tmp/ws", false, "app-same-bot");
+  assert.equal(botA.status, "acquired");
 
-    await first.handle.release();
-    const third = await acquireGatewayLock("/tmp/ws", false, "app-bot-a");
-    assert.equal(third.status, "acquired", "after release the same bot can connect again");
-    await third.handle.release();
-  } finally {
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
-    rmSync(homeDir, { recursive: true, force: true });
+  const botB = await acquireGatewayLock("/tmp/ws", false, "app-same-bot");
+  assert.equal(botB.status, "busy", "same bot should be exclusive");
+  if (botB.status === "busy") {
+    assert.equal(botB.owner.pid, process.pid, "owner should be this process");
   }
+
+  await botA.handle.release();
+  const botC = await acquireGatewayLock("/tmp/ws", false, "app-same-bot");
+  assert.equal(botC.status, "acquired", "after release, same bot can acquire again");
+  await botC.handle.release();
+  assert.ok(gatewayLockPath().startsWith(homeDir), "lock file must live in the isolated home");
 });
