@@ -149,7 +149,11 @@ export class RelayGateway {
 
   protectsSession(sessionId: string) { return this.sessions.has(sessionId) || Boolean(this.binding(sessionId)); }
 
-  private binding(sessionId: string) { return this.state.bindings.find((b) => b.sessionId === sessionId); }
+  /** 会话可能有多个绑定记录（解绑后换名会新增）；状态与操作始终指向启用的那个。 */
+  private binding(sessionId: string) {
+    return this.state.bindings.find((b) => b.sessionId === sessionId && b.enabled)
+      ?? [...this.state.bindings].reverse().find((b) => b.sessionId === sessionId);
+  }
   private save() { writeRelayJson(this.statePath, this.state); }
 
   private async command(sessionId: string, method: string, params: any) {
@@ -167,14 +171,16 @@ export class RelayGateway {
     }
     const binding = this.binding(sessionId);
     if (method === "bind") {
-      if (binding) {
+      const title = `${requireString(params?.title, 80)} [${sessionId.slice(0, 8)}]`;
+      if (binding?.title === title) {
+        // 同名重绑（含解绑后）：复用原话题，不重复创建。
         binding.enabled = true;
         this.save();
         return binding;
       }
+      if (binding?.enabled) throw new Error(`当前会话已绑定「${binding.title}」；如需更换话题请先 /feishu relay unbind。`);
       if (!this.state.settings) throw new Error("请先在终端执行 /feishu relay setup <群chat_id> <你的open_id>。");
       if (this.state.pendingTopic) throw new Error("上次话题创建结果未确认，已暂停创建及目标群的普通会话分派。请检查飞书并联系维护者处理 relay-state.pi.json 中的 pendingTopic，不要反复重试。");
-      const title = `${requireString(params?.title, 80)} [${sessionId.slice(0, 8)}]`;
       const { chatId } = this.state.settings;
       this.state.pendingTopic = { sessionId, title };
       this.save();

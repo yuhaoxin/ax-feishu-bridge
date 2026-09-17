@@ -56,7 +56,8 @@ test("接力：两个真实 TCP 客户端独立绑定，授权、去重及忙时
   const b = f.client("session-b", async (method, params) => { inputs.push({ method, params }); return { accepted: true, busy: true }; });
   const binding = await b.request("bind", { title: "会话 B" });
   assert.notEqual(a.threadId, binding.threadId);
-  assert.equal((await b.request("bind", { title: "不会新建" })).threadId, binding.threadId);
+  assert.equal((await b.request("bind", { title: "会话 B" })).threadId, binding.threadId);
+  await assert.rejects(b.request("bind", { title: "不会新建" }), /已绑定/);
   assert.equal(f.topics.length, 2);
   assert.equal(await f.gateway.handleMessage(incoming(binding.threadId, "unauthorized", "ou_stranger")), true);
   assert.equal(inputs.length, 0);
@@ -69,6 +70,26 @@ test("接力：两个真实 TCP 客户端独立绑定，授权、去重及忙时
   await assert.rejects(b.request("configure", { chatId: "oc_another", ownerOpenId: "ou_owner" }), /不允许更换/);
   assert.equal(statSync(f.endpoint).mode & 0o777, 0o600);
   assert.equal(statSync(f.state).mode & 0o777, 0o600);
+});
+
+test("接力：解绑后换名创建新话题，旧话题继续拦截，状态指向新绑定", async (t) => {
+  const f = await fixture(t);
+  const first = await f.a.request("bind", { title: "旧名" });
+  await f.a.request("unbind");
+  const second = await f.a.request("bind", { title: "新名" });
+  assert.notEqual(second.threadId, first.threadId);
+  assert.equal((await f.a.request("status")).title, second.title);
+  assert.equal(f.topics.length, 2);
+  await f.gateway.handleMessage(incoming(first.threadId, "old-topic"));
+  assert.match(f.text.at(-1)!.text, /解绑/);
+  const before = f.text.length;
+  await f.gateway.handleMessage(incoming(second.threadId, "new-topic"));
+  assert.equal(f.text.length, before, "新话题正常送达时不产生拒绝提示");
+  // 同名重绑仍复用，不产生第三条话题
+  await f.a.request("unbind");
+  const reused = await f.a.request("bind", { title: "新名" });
+  assert.equal(reused.threadId, second.threadId);
+  assert.equal(f.topics.length, 2);
 });
 
 test("接力：离线、解绑拒绝，不回落后台，不在重连后重放", async (t) => {
