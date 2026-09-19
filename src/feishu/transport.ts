@@ -403,7 +403,7 @@ export class FeishuTransport {
   async createRelayTopic(chatId: string, title: string) {
     const result = await this.sdkClient.im.message.create({
       params: { receive_id_type: "chat_id" },
-      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: `${title}\nPi 会话接力已建立。` }), uuid: randomUUID() },
+      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: relayRootText(title) }), uuid: randomUUID() },
     });
     const data = this.relayResult(result);
     if (!data.message_id || !data.thread_id) throw new Error("飞书未返回完整话题标识，话题可能已创建但未绑定；请检查飞书后再操作。");
@@ -441,7 +441,7 @@ export class FeishuTransport {
     // 话题标题即根消息内容的展示：patch 根消息 = 原话题改名，thread_id 不变。
     const result = await this.sdkClient.im.v1.message.patch({
       path: { message_id: rootMessageId },
-      data: { content: JSON.stringify({ text: `${title}\nPi 会话接力已建立。` }) },
+      data: { content: JSON.stringify({ text: relayRootText(title) }) },
     });
     this.relayResult(result);
   }
@@ -640,6 +640,14 @@ export class FeishuTransport {
     debugLog("feishu.download.image.fallback_done", { messageId, imageKey, bytes: bytes.length });
     return { bytes, mimeType: "image/jpeg" };
   }
+}
+
+/**
+ * 接力话题的根消息正文。飞书把根消息内容当作话题标题展示，所以这段文案同时充当标题和说明；
+ * 创建与改名必须用同一个函数，否则改名后话题说明会前后不一致。
+ */
+function relayRootText(title: string) {
+  return `${title}\n本话题接收本机终端输入与每轮正式回复。`;
 }
 
 function splitText(text: string, maxBytes: number) {

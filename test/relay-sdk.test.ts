@@ -14,6 +14,8 @@ import { registerRelayExtension } from "../src/adapters/pi/relay-extension.ts";
 test("接力端到端：飞书输入写入真实 Pi 会话并触发回答，订阅者实时收到事件", { timeout: 30_000 }, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "pi-relay-sdk-"));
   const cards: any[] = [];
+  // 话题内实际发出的内容与顺序（输入镜像、正式回复）
+  const sent: string[] = [];
   const events: any[] = [];
   const errors: any[] = [];
   let modelRequests = 0;
@@ -41,8 +43,8 @@ test("接力端到端：飞书输入写入真实 Pi 会话并触发回答，订�
   const gateway = new RelayGateway(join(dir, "relay.json"), endpoint, "app", {
     async verifyTopicChat() {},
     async createRelayTopic() { return { threadId: "omt_test", rootMessageId: "om_root" }; },
-    async replyRelayText() {},
-    async replyRelayCard(_root, card) { cards.push(card); return "om_reply"; },
+    async replyRelayText(_root, text) { sent.push(`text:${text}`); },
+    async replyRelayCard(_root, card) { sent.push(`card:${card.elements[0].content}`); cards.push(card); return "om_reply"; },
   });
   await gateway.start();
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: join(dir, "models.json"), modelsStorePath: join(dir, "models-store.json"), allowModelNetwork: false });
@@ -71,7 +73,7 @@ test("接力端到端：飞书输入写入真实 Pi 会话并触发回答，订�
   });
   await command("setup oc_test ou_owner", context);
   // 自动绑定：session_start（startup）标记待绑定，首条用户 input 触发 autobindTopic
-  await session.extensionRunner!.emit({ type: "input", text: "SDK 验收工作", source: "user" } as any);
+  await session.extensionRunner!.emit({ type: "input", text: "SDK 验收工作", source: "interactive" } as any);
   await gateway.handleMessage({ chatId: "oc_test", chatType: "group", threadId: "omt_test", messageId: "om_in", senderOpenId: "ou_owner", msgType: "text", content: JSON.stringify({ text: "来自飞书的真实输入" }) });
   for (let i = 0; i < 200 && !events.some((e) => e.type === "message_update"); i++) await delay(10);
   assert.ok(events.some((e) => e.type === "message_end" && e.message.role === "user"));
@@ -82,6 +84,8 @@ test("接力端到端：飞书输入写入真实 Pi 会话并触发回答，订�
   assert.equal(modelRequests, 1);
   assert.equal(cards.length, 1, JSON.stringify(errors));
   assert.equal(cards[0].elements[0].content, "正式答案");
+  // 本地输入镜像与正式回复都发到同一话题，且镜像在前：话题内顺序与终端一致
+  assert.deepEqual(sent, ["text:🖥 输入：SDK 验收工作", "card:正式答案"]);
   assert.ok(session.messages.some((m: any) => m.role === "user" && JSON.stringify(m.content).includes("来自飞书的真实输入")));
   assert.deepEqual(errors, []);
 });

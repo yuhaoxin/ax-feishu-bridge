@@ -4,6 +4,8 @@ export type RelayBinding = {
   threadId: string;
   rootMessageId: string;
   title: string;
+  /** 创建话题时的首条本地输入，会话名被清空后据此回退标题。 */
+  firstInput: string;
   enabled: boolean;
 };
 

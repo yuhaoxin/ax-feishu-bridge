@@ -23,6 +23,9 @@ async function fixture(t: any) {
   const inputs: any[] = [];
   const notices: string[] = [];
   const cards: any[] = [];
+  const journal: string[] = [];
+  // 扩展主动发到话题的内容（输入镜像、正式回复、无答案说明）；不含网关自己的投递状态回执
+  const outbound = () => journal.filter((entry) => entry.startsWith("card:") || entry.startsWith("text:🖥 输入：") || entry.startsWith("text:本轮没有正式回复"));
   const renames: Array<{ root: string; title: string }> = [];
   const status = new Map<string, string>();
   let busy = false;
@@ -30,11 +33,13 @@ async function fixture(t: any) {
   let sessionName: string | undefined;
   let cwd = "/ws/demo-project";
   let topic = 0;
+  let sendFailure: string | undefined;
+  let attempts = 0;
   const transport: RelayTransport = {
     async verifyTopicChat() {},
     async createRelayTopic() { topic++; return { threadId: `omt_${topic}`, rootMessageId: `om_${topic}` }; },
-    async replyRelayText(_root, text) { notices.push(text); },
-    async replyRelayCard(root, card) { cards.push({ root, card }); return `card_${cards.length}`; },
+    async replyRelayText(_root, text) { attempts++; if (sendFailure) throw new Error(sendFailure); notices.push(text); journal.push(`text:${text}`); },
+    async replyRelayCard(root, card) { attempts++; if (sendFailure) throw new Error(sendFailure); cards.push({ root, card }); journal.push(`card:${card.elements[0].content}`); return `card_${cards.length}`; },
     async renameRelayTitle(root, title) { renames.push({ root, title }); },
   };
   const gateway = new RelayGateway(join(dir, "state.json"), join(dir, "endpoint.json"), "app", transport);
@@ -63,7 +68,9 @@ async function fixture(t: any) {
     chatId: "oc_test", chatType: "group", threadId, messageId, senderOpenId: "ou_owner", msgType: "text", content: JSON.stringify({ text: "来自飞书" }),
   });
   return {
-    emit, emitAsync, ctx, command, inputs, cards, renames, notices, incoming, handlers, tools, status,
+    emit, emitAsync, ctx, command, inputs, cards, renames, notices, incoming, handlers, tools, status, journal, outbound,
+    attempts: () => attempts,
+    setSendFailure: (value: string | undefined) => { sendFailure = value; },
     topicCount: () => topic,
     setBusy: (value: boolean) => { busy = value; },
     setSessionName: (value: string | undefined) => { sessionName = value; },
@@ -76,60 +83,89 @@ function assistant(text: string, stopReason = "stop", extra: any[] = []) {
   return { message: { role: "assistant", stopReason, content: [{ type: "text", text }, ...extra] } };
 }
 
-test("relayTitle：会话名优先，其次首条消息截断，最后工作目录", () => {
-  assert.equal(relayTitle("命名会话", "首条消息", "/ws/x"), "命名会话");
-  assert.equal(relayTitle(undefined, "帮我修 relay bug\n第二行内容", "/ws/x"), "帮我修 relay bug 第二行内容");
-  assert.equal(relayTitle(undefined, "   ", "/ws/demo-project"), "demo-project");
-  assert.equal(relayTitle(undefined, "", "/"), "Pi");
+test("relayTitle：目录名打头，显式会话名优先于首条输入", () => {
+  assert.equal(relayTitle(undefined, "帮我修 relay bug\n第二行内容", "/ws/demo-project"), "demo-project:帮我修 relay bug 第二行内容");
+  assert.equal(relayTitle("命名会话", "首条消息", "/ws/x"), "x:命名会话");
+  assert.equal(relayTitle(undefined, "   ", "/ws/demo-project"), "demo-project:未命名");
+  assert.equal(relayTitle(undefined, "", "/"), "Pi:未命名");
+  // 目录名截 20、首条输入截 30，避免长标题在飞书侧被截得看不出重点
+  assert.equal(relayTitle(undefined, "x".repeat(40), `/ws/${"d".repeat(30)}`), `${"d".repeat(20)}:${"x".repeat(30)}`);
 });
 
-test("接力扩展：新会话首条消息自动建话题，标题取自首条消息", async (t) => {
+test("接力扩展：只有终端输入建话题并镜像本地输入，飞书输入不回显", async (t) => {
   const f = await fixture(t);
   assert.equal(f.topicCount(), 0, "未输入不建话题");
-  await f.emitAsync("input", { text: "帮我修 relay bug\n第二行", source: "user" });
-  await waitFor(() => (f.status.get("feishu-relay") || "").startsWith("飞书接力："));
-  assert.match(f.status.get("feishu-relay")!, /帮我修 relay bug/);
+  // 其它扩展或 RPC 注入的消息不是用户输入：不建话题也不镜像
+  await f.emitAsync("input", { text: "扩展注入的内容", source: "extension" });
+  await f.emitAsync("input", { text: "RPC 注入的内容", source: "rpc" });
+  assert.equal(f.topicCount(), 0, "非终端输入不建话题");
+  assert.deepEqual(f.outbound(), [], "非终端输入不镜像");
+  await f.emitAsync("input", { text: "帮我修 relay bug\n第二行", source: "interactive" });
+  // 镜像与建话题在同一次输入里完成；先等镜像送达再断言话题标题
+  await waitFor(() => f.outbound().length === 1);
+  assert.match(f.status.get("feishu-relay")!, /demo-project:帮我修 relay bug 第二行/);
   assert.equal(f.topicCount(), 1);
+  assert.deepEqual(f.outbound(), ["text:🖥 输入：帮我修 relay bug\n第二行"], "首条输入也要镜像");
   // 后续输入不重复建话题
-  await f.emitAsync("input", { text: "第二条", source: "user" });
+  await f.emitAsync("input", { text: "第二条", source: "interactive" });
+  await waitFor(() => f.outbound().length === 2);
   assert.equal(f.topicCount(), 1);
-  // 飞书输入进入 TUI，忙时也走 steer
+  // 飞书输入进入 TUI，忙时也走 steer；来源是飞书，所以不回显
   await f.incoming("first");
   assert.deepEqual(f.inputs, [{ text: "来自飞书", options: { deliverAs: "steer" } }]);
   f.setBusy(true);
   await f.incoming("second");
   assert.deepEqual(f.inputs[1], { text: "来自飞书", options: { deliverAs: "steer" } });
+  assert.equal(f.outbound().length, 2, "飞书来源的输入不回显");
+  // 镜像先入队、正式回复排在其后：话题内顺序与终端一致
+  await f.emit("agent_start");
+  await f.emit("message_end", assistant("第一轮答案"));
+  await f.emit("agent_end");
+  await waitFor(() => f.outbound().length === 3);
+  assert.deepEqual(f.outbound().slice(1), ["text:🖥 输入：第二条", "card:第一轮答案"]);
 });
 
-test("接力扩展：会话名中途变化自动同步话题标题；清空名字保持不变", async (t) => {
+test("接力扩展：图片输入用占位符镜像", async (t) => {
   const f = await fixture(t);
-  await f.emitAsync("input", { text: "初始工作", source: "user" });
+  const image = { type: "image", data: "aGk=", mimeType: "image/png" };
+  await f.emitAsync("input", { text: "看看这张图", source: "interactive", images: [image, image] });
+  await waitFor(() => f.outbound().length === 1);
+  assert.deepEqual(f.outbound(), ["text:🖥 输入：看看这张图 [图片 ×2]"], "图片数量要写进镜像");
+  // 只贴图不打字时镜像不能是空的，否则话题里会出现一条没有内容的输入
+  await f.emitAsync("input", { text: "", source: "interactive", images: [image] });
+  await waitFor(() => f.outbound().length === 2);
+  assert.deepEqual(f.outbound()[1], "text:🖥 输入：[图片 ×1]");
+});
+
+test("接力扩展：会话名变化同步标题，清空后回退到首条输入", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "初始工作", source: "interactive" });
   await waitFor(() => (f.status.get("feishu-relay") || "").startsWith("飞书接力："));
   f.setSessionName("重构飞书接力");
   await f.emit("session_info_changed", { name: "重构飞书接力" });
   await waitFor(() => f.renames.length === 1);
-  assert.match(f.renames[0].title, /重构飞书接力 \[session-/);
+  assert.match(f.renames[0].title, /^demo-project:重构飞书接力 \[session-\]$/);
   f.setSessionName(undefined);
   await f.emit("session_info_changed", { name: undefined });
-  await delay(30);
-  assert.equal(f.renames.length, 1, "名字清空不改话题标题");
+  await waitFor(() => f.renames.length === 2);
+  assert.match(f.renames[1].title, /^demo-project:初始工作 \[session-\]$/, "名字清空回退到首条输入");
 });
 
 test("接力扩展：unbind 永久退出名单；其它会话仍自动绑定", async (t) => {
   const f = await fixture(t);
-  await f.emitAsync("input", { text: "第一轮", source: "user" });
+  await f.emitAsync("input", { text: "第一轮", source: "interactive" });
   await waitFor(() => (f.status.get("feishu-relay") || "").startsWith("飞书接力："));
   await f.command("unbind", f.ctx);
   await f.incoming("blocked", "omt_1");
   assert.match(f.notices.at(-1)!, /解绑/);
   // 原会话退出名单：即使重新 attach（resume/new）也不再自动绑定
   await f.emitAsync("session_start", { reason: "resume" });
-  await f.emitAsync("input", { text: "想回来", source: "user" });
+  await f.emitAsync("input", { text: "想回来", source: "interactive" });
   assert.equal(f.topicCount(), 1);
   // 新会话不受退出名单影响
   f.switchTo("session-two");
   await f.emitAsync("session_start", { reason: "new" });
-  await f.emitAsync("input", { text: "第二会话工作", source: "user" });
+  await f.emitAsync("input", { text: "第二会话工作", source: "interactive" });
   await waitFor(() => (f.status.get("feishu-relay") || "").includes("第二会话工作"));
   assert.equal(f.topicCount(), 2);
   await f.emit("agent_start");
@@ -144,10 +180,71 @@ test("接力扩展：autobind 开关与错误用法；配置入口不向模型�
   const tool = f.tools.find((tool) => tool.name === "feishu_relay");
   assert.ok(tool);
   assert.doesNotMatch(JSON.stringify(tool.parameters), /configure|ownerOpenId|chatId|"const":"bind"/);
+  // 输入镜像开关决定本机输入是否外发，只能由终端命令控制
+  assert.doesNotMatch(JSON.stringify(tool.parameters), /echo/);
   await f.command("autobind off", f.ctx);
   assert.ok(f.notices.some((text) => text.includes("关闭")));
-  await f.emitAsync("input", { text: "关闭开关后的输入", source: "user" });
+  await f.emitAsync("input", { text: "关闭开关后的输入", source: "interactive" });
   assert.equal(f.topicCount(), 0, "开关关闭时输入不建话题");
+  assert.deepEqual(f.journal, [], "没有话题就没有镜像去处");
   await assert.rejects(f.command("autobind", f.ctx), /relay/);
   await assert.rejects(f.command("push 内容", { ...f.ctx, hasUI: false }), /Pi TUI/);
+});
+
+test("接力扩展：每条正式答案都推送，整轮没有答案时说明一声", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "开始", source: "interactive" });
+  await waitFor(() => f.journal.length === 1);
+  await f.emit("agent_start");
+  // 含工具调用的中间消息与思考块都不是正式答案
+  await f.emit("message_end", assistant("先看看文件", "stop", [{ type: "toolCall", id: "t1", name: "read", arguments: {} }]));
+  await f.emit("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "过程说明", textSignature: JSON.stringify({ v: 1, id: "s1", phase: "commentary" }) }] } });
+  await f.emit("message_end", assistant("第一段答案"));
+  await f.emit("message_end", assistant("第二段答案"));
+  await f.emit("agent_end");
+  await waitFor(() => f.journal.length === 3);
+  assert.deepEqual(f.journal.slice(1), ["card:第一段答案", "card:第二段答案"], "同一轮的每条正式答案都要推送");
+  // 下一轮被中止：没有正式答案，推一条状态文本而不是静默
+  await f.emit("agent_start");
+  await f.emit("message_end", assistant("被中断的草稿", "aborted"));
+  await f.emit("agent_end");
+  await waitFor(() => f.journal.length === 4);
+  assert.match(f.journal[3], /^text:本轮没有正式回复/);
+});
+
+test("接力扩展：关闭输入镜像只停镜像，话题与正式回复照常", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "首条", source: "interactive" });
+  await waitFor(() => f.journal.length === 1);
+  await f.command("echo off", f.ctx);
+  assert.ok(f.notices.some((text) => text.includes("输入镜像已关闭")));
+  await f.emitAsync("input", { text: "第二条", source: "interactive" });
+  await f.emit("agent_start");
+  await f.emit("message_end", assistant("答案"));
+  await f.emit("agent_end");
+  await waitFor(() => f.journal.length === 2);
+  assert.equal(f.topicCount(), 1);
+  assert.equal(f.journal[1], "card:答案");
+  await f.command("status", f.ctx);
+  assert.ok(f.notices.some((text) => text.includes("输入镜像：关闭")), "status 要显示输入镜像状态");
+  await assert.rejects(f.command("echo", f.ctx), /relay/);
+});
+
+test("接力扩展：连续推送失败只提示首条与一条汇总，推送成功后恢复", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "第一条", source: "interactive" });
+  await waitFor(() => f.journal.length === 1);
+  f.setSendFailure("飞书不可用");
+  for (const text of ["一", "二", "三", "四"]) await f.emitAsync("input", { text, source: "interactive" });
+  await waitFor(() => f.attempts() === 5);
+  assert.equal(f.notices.filter((text) => text === "飞书不可用").length, 1, "首次失败给出原始错误");
+  assert.equal(f.notices.filter((text) => text.includes("连续 3 次推送失败")).length, 1, "第 3 次失败合并成一条");
+  assert.equal(f.journal.length, 1, "失败期间没有任何内容进入话题");
+  f.setSendFailure(undefined);
+  await f.emitAsync("input", { text: "五", source: "interactive" });
+  await waitFor(() => f.journal.length === 2);
+  f.setSendFailure("飞书不可用");
+  await f.emitAsync("input", { text: "六", source: "interactive" });
+  await waitFor(() => f.attempts() === 7);
+  assert.equal(f.notices.filter((text) => text === "飞书不可用").length, 2, "推送成功后失败提示重新逐条给出");
 });

@@ -8,9 +8,10 @@ import { RelayPeer } from "./relay-rpc.ts";
 import { sendRelayAnswer, type RelayBinding, type RelayTransport } from "./relay-output.ts";
 
 export type RelayState = {
-  version: 1;
+  version: 2;
   appId: string;
-  settings?: { chatId: string; ownerOpenId: string; autobind?: boolean };
+  /** autobind 缺省为开；echo（本地输入镜像）缺省为开。 */
+  settings?: { chatId: string; ownerOpenId: string; autobind?: boolean; echo?: boolean };
   pendingTopic?: { sessionId: string; title: string };
   bindings: RelayBinding[];
   receipts: Record<string, number>;
@@ -41,12 +42,16 @@ export class RelayGateway {
     private readonly transport: RelayTransport,
     private readonly isBackendSession: (sessionId: string) => Promise<boolean> = async () => false,
   ) {
-    this.state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { version: 1, appId, bindings: [], receipts: {}, optOut: [] };
+    const parsed: any = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { version: 2, appId, bindings: [], receipts: {}, optOut: [] };
+    this.state = parsed;
     if (!Array.isArray(this.state.optOut)) this.state.optOut = [];
-    if (this.state.version !== 1 || this.state.appId !== appId || !Array.isArray(this.state.bindings) || !this.state.receipts)
+    // 旧版本缺 firstInput，无法重建话题标题；直接拒绝比猜测回退规则安全。
+    if (parsed.version === 1)
+      throw new Error("接力状态文件是旧版本，不再兼容：请停止网关、备份 relay-state.pi.json 后删除该文件，再重新执行 /feishu relay setup。删除后旧接力话题会回落为普通后台会话，请先确认旧话题不再使用。");
+    if (parsed.version !== 2 || parsed.appId !== appId || !Array.isArray(parsed.bindings) || !parsed.receipts)
       throw new Error("接力状态无效或属于其他机器人，请检查接力状态文件。");
     for (const binding of this.state.bindings) {
-      if (![binding.sessionId, binding.chatId, binding.threadId, binding.rootMessageId, binding.title].every((s) => typeof s === "string" && s.length) || typeof binding.enabled !== "boolean") {
+      if (![binding.sessionId, binding.chatId, binding.threadId, binding.rootMessageId, binding.title, binding.firstInput].every((s) => typeof s === "string" && s.length) || typeof binding.enabled !== "boolean") {
         throw new Error("接力绑定数据损坏；为避免消息进入错误会话，已停止接力服务。");
       }
     }
@@ -65,11 +70,11 @@ export class RelayGateway {
           if (this.sessions.has(id)) throw new Error("同一会话已在另一个终端连接，请先断开原终端。");
           sessionId = id;
           this.sessions.set(id, peer);
-          return this.binding(id);
+          return this.relayView(id);
         }
         if (!sessionId || this.sessions.get(sessionId) !== peer) throw new Error("请先注册当前会话。");
         const id = sessionId;
-        if (method === "ping" || method === "status") return this.binding(id);
+        if (method === "ping" || method === "status") return this.relayView(id);
         if (method === "output") {
           const binding = this.binding(id);
           if (!binding?.enabled) throw new Error("当前会话尚未绑定或已解绑。");
@@ -156,6 +161,11 @@ export class RelayGateway {
     return this.state.bindings.find((b) => b.sessionId === sessionId && b.enabled)
       ?? [...this.state.bindings].reverse().find((b) => b.sessionId === sessionId);
   }
+
+  /** register/ping/status 统一返回绑定与全局开关：终端据此决定是否镜像本地输入。 */
+  private relayView(sessionId: string) {
+    return { binding: this.binding(sessionId), echo: this.state.settings?.echo !== false };
+  }
   private save() { writeRelayJson(this.statePath, this.state); }
 
   private async command(sessionId: string, method: string, params: any) {
@@ -178,18 +188,27 @@ export class RelayGateway {
       this.save();
       return { autobind: this.state.settings.autobind };
     }
+    if (method === "echo") {
+      if (!this.state.settings) throw new Error("请先在终端执行 /feishu relay setup <群chat_id> <你的open_id>。");
+      if (typeof params?.enabled !== "boolean") throw new Error("输入镜像开关需要 on 或 off。");
+      this.state.settings.echo = params.enabled;
+      this.save();
+      return { echo: this.state.settings.echo };
+    }
     if (method === "autobindTopic") {
       if (!this.state.settings) return { created: false, reason: "unconfigured" };
       if (this.state.settings.autobind === false) return { created: false, reason: "disabled" };
       if (binding?.enabled) return { created: true, binding };
       if (this.state.optOut.includes(sessionId)) return { created: false, reason: "opted-out" };
       if (this.state.pendingTopic) throw new Error("上次话题创建结果未确认，已暂停创建及目标群的普通会话分派。请检查 relay-state.pi.json 中的 pendingTopic，不要反复重试。");
+      // firstInput 先校验：参数不合格时不能留下 pendingTopic 把后续创建全部阻断。
       const title = `${requireString(params?.title, 120)} [${sessionId.slice(0, 8)}]`;
+      const firstInput = requireString(params?.firstInput, 200);
       const { chatId } = this.state.settings;
       this.state.pendingTopic = { sessionId, title };
       this.save();
       const topic = await this.transport.createRelayTopic(chatId, title);
-      const created = { sessionId, chatId, title, enabled: true, ...topic };
+      const created = { sessionId, chatId, title, firstInput, enabled: true, ...topic };
       const next = { ...this.state, bindings: [...this.state.bindings, created] };
       delete next.pendingTopic;
       writeRelayJson(this.statePath, next);

@@ -13,15 +13,21 @@ test("飞书传输：创建话题验证群主，出站指定 thread 且校验业
   const calls: any[] = [];
   let response: any = { code: 0, data: { message_id: "om_root", thread_id: "omt_topic", group_message_type: "thread", owner_id: "ou_owner" } };
   const call = async (params: any) => { calls.push(params); return response; };
-  (transport as any).sdkClient = { im: { v1: { chat: { get: call } }, message: { create: call, reply: call } } };
+  (transport as any).sdkClient = { im: { v1: { chat: { get: call }, message: { patch: call } }, message: { create: call, reply: call } } };
   await transport.verifyTopicChat("oc_group", "ou_owner");
   await assert.rejects(transport.verifyTopicChat("oc_group", "ou_stranger"), /群主/);
   const topic = await transport.createRelayTopic("oc_group", "标题");
   assert.deepEqual(topic, { threadId: "omt_topic", rootMessageId: "om_root" });
+  // 根消息正文就是话题标题的展示，同时说明本话题会收到什么
+  assert.equal(JSON.parse(calls.at(-1).data.content).text, "标题\n本话题接收本机终端输入与每轮正式回复。");
   await transport.replyRelayCard(topic.rootMessageId, { elements: [] });
   assert.equal(calls.at(-1).data.reply_in_thread, true);
   assert.equal(calls.at(-1).path.message_id, "om_root");
   assert.ok(calls.at(-1).data.uuid);
+  // 改名后话题说明必须与创建时一致
+  await transport.renameRelayTitle(topic.rootMessageId, "新标题");
+  assert.equal(calls.at(-1).path.message_id, "om_root");
+  assert.equal(JSON.parse(calls.at(-1).data.content).text, "新标题\n本话题接收本机终端输入与每轮正式回复。");
   await transport.replyRelayText(topic.rootMessageId, "通知");
   assert.equal(calls.at(-1).data.reply_in_thread, true);
   response = { code: 999, msg: "internal details" };
