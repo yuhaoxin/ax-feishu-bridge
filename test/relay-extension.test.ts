@@ -248,3 +248,26 @@ test("接力扩展：连续推送失败只提示首条与一条汇总，推送�
   await waitFor(() => f.attempts() === 7);
   assert.equal(f.notices.filter((text) => text === "飞书不可用").length, 2, "推送成功后失败提示重新逐条给出");
 });
+
+test("接力扩展：正常退出推送对话关闭提示（默认开），切换会话不发", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "开始", source: "interactive" });
+  await waitFor(() => f.journal.length === 1);
+  // /new、/resume、/fork、/reload 也会触发 session_shutdown，但话题仍由后继会话使用
+  await f.emitAsync("session_shutdown", { reason: "resume" });
+  assert.equal(f.journal.length, 1, "切换会话不发关闭提示");
+});
+
+test("接力扩展：退出时话题收到关闭提示，exit-notice off 后不再推送", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "开始", source: "interactive" });
+  await waitFor(() => f.journal.length === 1);
+  await f.emitAsync("session_shutdown", { reason: "quit" });
+  assert.match(f.journal[1], /^text:🔚 对话已关闭/, "退出时话题里收到一条关闭提示");
+  // 开关关闭后退出保持安静；参数不合法时返回完整说明而不是静默失败
+  await f.command("exit-notice off", f.ctx);
+  assert.ok(f.notices.some((text) => text.includes("退出通知已关闭")));
+  await f.emitAsync("session_shutdown", { reason: "quit" });
+  assert.equal(f.journal.length, 2, "关闭开关后退出不再推送");
+  await assert.rejects(f.command("exit-notice", f.ctx), /relay/);
+});

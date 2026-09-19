@@ -205,6 +205,20 @@ test("接力：输入镜像开关默认开，可全局关闭并持久化", async
   assert.equal((await b.request("status")).echo, false);
 });
 
+test("接力：退出通知开关默认开，可全局关闭并持久化", async (t) => {
+  const f = await fixture(t);
+  // status 带开关状态，终端不必额外探测就知道退出时是否推送关闭提示
+  assert.equal((await f.a.request("status")).exitNotice, true);
+  await assert.rejects(f.a.request("exitNotice", {}), /on 或 off/);
+  assert.equal((await f.a.request("exitNotice", { enabled: false })).exitNotice, false);
+  assert.equal((await f.a.request("ping")).exitNotice, false);
+  assert.equal((await f.a.request("status")).exitNotice, false);
+  assert.equal(JSON.parse(readFileSync(f.state, "utf8")).settings.exitNotice, false);
+  // 开关是全局设置：另一个会话看到同一个值
+  const b = f.client("session-b");
+  assert.equal((await b.request("status")).exitNotice, false);
+});
+
 test("接力：缺少 firstInput 不建话题，也不留下 pendingTopic", async (t) => {
   const f = await fixture(t);
   await assert.rejects(f.a.request("autobindTopic", { title: "缺参数" }), /需要非空文本/);

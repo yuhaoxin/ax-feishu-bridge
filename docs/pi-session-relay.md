@@ -36,17 +36,19 @@ pi install git:github.com/yuhaoxin/ax-feishu-bridge@feat/feishu-session-handoff
 ```text
 /feishu relay status
 /feishu relay echo on|off
+/feishu relay exit-notice on|off
 /feishu relay push 指定通知内容
 /feishu relay unbind
 ```
 
-模型可调用 `feishu_relay` 工具的 `status`、`push`、`unbind`、`autobind` 操作。显式推送应由用户明确要求。工具没有任意收件人参数，仅操作当前会话，也不能改变群、授权账号或输入镜像开关。
+模型可调用 `feishu_relay` 工具的 `status`、`push`、`unbind`、`autobind` 操作。显式推送应由用户明确要求。工具没有任意收件人参数，仅操作当前会话，也不能改变群、授权账号、输入镜像或退出通知开关。
 
 本地输入镜像默认开启：你在终端里敲的每条输入都会以 `🖥 输入：` 前缀发到话题，与模型回复一起构成完整的对话记录；只有图片没有文字时用 `[图片 ×N]` 占位。`/feishu relay echo off` 关闭后话题只收正式回复，重新打开不补推关闭期间的输入。扩展命令（如 `/feishu relay ...`）由 Pi 在输入事件之前拦截，不会进入话题；`/skill:` 与模板会被镜像为输入原文。飞书发来的消息在飞书侧本来就可见，不会回显。
 
 - 在绑定话题回复文本即可继续操作对应终端，无需在多个会话间执行 `/resume`。
 - TUI 忙时使用 Pi 的 `steer` 队列，在工具执行边界引导当前任务，不强制中止运行中的工具。
 - TUI 关闭、切换会话或接力断联时不交给后台接管；离线输入不排队、不自动重放。
+- 正常退出 TUI（Ctrl+C、Ctrl+D、`/quit`，以及 SIGTERM/SIGHUP 触发的关闭）时向绑定话题推送一条「对话已关闭」提示，默认开，`/feishu relay exit-notice off` 关闭。切换会话（`/new`、`/resume`、`/fork`）、`/reload`、终端消失或进程被强杀都不推送；网关未运行或话题已解绑时发不出。推送超过 1.5 秒等待上限时终端不再等待，消息可能已送达也可能没有。
 - 同一会话重新打开后自动恢复连接和绑定。断线期间的输出不自动补发，需要时显式推送。
 - 同一会话不能由两个 TUI 接力连接同时占用。已由普通飞书后台加载的会话不能接力注册；先在飞书切换到新会话并重启网关。
 - 接力管理的会话不能再从普通飞书 `/resume` 路径驱动后台模型，避免两处写入同一历史。

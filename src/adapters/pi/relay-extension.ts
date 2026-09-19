@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { RelayClient } from "./relay-client.ts";
@@ -9,6 +10,19 @@ const AUTOBIND_REASONS = new Set(["startup", "new", "fork"]);
 
 /** 本地终端输入的镜像前缀：话题里必须一眼看出这是本机输入而不是模型回复。 */
 const ECHO_PREFIX = "🖥 输入：";
+
+/** 退出 TUI 时推送的对话关闭提示：会话结束但话题保留，重新打开该会话即可继续接力。 */
+const EXIT_NOTICE = "🔚 对话已关闭：Pi TUI 已退出，重新打开该会话后可继续接力。";
+
+/** 退出提示的等待上限：pi 会等 session_shutdown 处理完才退出，网关或网络异常时不能让退出卡住。 */
+const EXIT_NOTICE_TIMEOUT_MS = 1500;
+
+/** /feishu relay 的开关命令：命令名映射网关方法名、返回值字段与提示文案。 */
+const RELAY_TOGGLES: Record<string, { method: string; label: string; field: string }> = {
+  autobind: { method: "autobind", label: "新会话自动绑定", field: "autobind" },
+  echo: { method: "echo", label: "输入镜像", field: "echo" },
+  "exit-notice": { method: "exitNotice", label: "退出通知", field: "exitNotice" },
+};
 
 /** 连续推送失败到第几次时，把逐条错误提示合并成一条，避免离线期间淹掉终端。 */
 const AGGREGATE_AFTER_FAILURES = 3;
@@ -81,6 +95,19 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     });
   }
 
+  /**
+   * 退出通知单独入队：排在已排队内容之后才能保持话题内顺序，且不能像普通出站那样在 detach 时被丢弃。
+   * 异常必须在此吞掉：outbox 一旦 reject，后续 enqueue 的发送会被整体跳过。
+   */
+  function enqueueFinal(work: (active: RelayClient) => Promise<unknown>) {
+    const active = client;
+    if (!active) return Promise.resolve();
+    outbox = outbox.then(async () => {
+      try { await work(active); } catch {}
+    });
+    return outbox;
+  }
+
   function detach() {
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = undefined;
@@ -137,7 +164,17 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
   }
 
   pi.on("session_start", (event, context) => attach(context, AUTOBIND_REASONS.has(event.reason)));
-  pi.on("session_shutdown", () => detach());
+  pi.on("session_shutdown", async (event) => {
+    const active = client;
+    // /new、/resume、/fork、/reload 也触发本事件，但话题仍由后继会话使用：只处理真正退出。
+    if (event.reason === "quit" && active?.binding?.enabled && active.exitNotice) {
+      await Promise.race([
+        enqueueFinal((current) => current.request("push", { text: EXIT_NOTICE }, EXIT_NOTICE_TIMEOUT_MS)),
+        delay(EXIT_NOTICE_TIMEOUT_MS, undefined, { ref: false }),
+      ]);
+    }
+    detach();
+  });
 
   pi.on("input", async (event) => {
     // 只有用户在终端里真正敲进来的输入才算：飞书注入（extension）与 RPC 既不建话题也不回显。
@@ -231,13 +268,12 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
       if (parts.length !== 2) throw new Error(relayHelp());
       await execute("configure", { chatId: parts[0], ownerOpenId: parts[1] }, context);
       context.ui.notify("接力目标及授权账号已配置。", "info");
-    } else if (action === "autobind" || action === "echo") {
+    } else if (RELAY_TOGGLES[action]) {
       const on = text.trim().toLowerCase();
       if (!["on", "off"].includes(on)) throw new Error(relayHelp());
-      const result = await execute(action, { enabled: on === "on" }, context);
-      context.ui.notify(action === "autobind"
-        ? `新会话自动绑定已${result.autobind ? "开启" : "关闭"}。`
-        : `输入镜像已${result.echo ? "开启" : "关闭"}。`, "info");
+      const toggle = RELAY_TOGGLES[action];
+      const result = await execute(toggle.method, { enabled: on === "on" }, context);
+      context.ui.notify(`${toggle.label}已${result[toggle.field] ? "开启" : "关闭"}。`, "info");
     } else if (["unbind", "status", "push"].includes(action)) {
       const result = await execute(action, { text }, context);
       context.ui.notify(formatResult(action, result, client?.echo !== false), "info");

@@ -10,6 +10,8 @@ export class RelayClient {
   binding?: RelayBinding;
   /** 输入镜像开关（网关全局设置，缺省为开）；随 register/ping/status/echo 刷新。 */
   echo = true;
+  /** 退出时的对话关闭提示开关（网关全局设置，缺省为开）；随 register/ping/status/exitNotice 刷新。 */
+  exitNotice = true;
   constructor(
     private readonly endpointPath: string,
     private readonly sessionId: string,
@@ -57,21 +59,23 @@ export class RelayClient {
     }
   }
 
-  async request(method: string, params: unknown = {}) {
+  async request(method: string, params: unknown = {}, timeoutMs?: number) {
     await this.connect();
     if (!this.peer?.connected) throw new Error("当前接力连接已离线。");
-    const result = await this.peer.request(method, params);
+    const result = await this.peer.request(method, params, timeoutMs);
     if (method === "register" || method === "ping" || method === "status") this.applyView(result);
     else if (method === "echo") this.echo = result?.echo !== false;
+    else if (method === "exitNotice") this.exitNotice = result?.exitNotice !== false;
     else if (method === "unbind" || method === "rename") this.binding = result;
     else if (method === "autobindTopic" && result?.created) this.binding = result.binding;
     return result;
   }
 
-  /** register/ping/status 返回绑定与全局开关；echo 缺省视为开。 */
+  /** register/ping/status 返回绑定与全局开关；两个开关缺省都视为开。 */
   private applyView(view: any) {
     this.binding = view?.binding;
     this.echo = view?.echo !== false;
+    this.exitNotice = view?.exitNotice !== false;
   }
 
   /** 输出只能走现有连接，不允许断线后自动重发。 */

@@ -10,8 +10,8 @@ import { sendRelayAnswer, type RelayBinding, type RelayTransport } from "./relay
 export type RelayState = {
   version: 2;
   appId: string;
-  /** autobind 缺省为开；echo（本地输入镜像）缺省为开。 */
-  settings?: { chatId: string; ownerOpenId: string; autobind?: boolean; echo?: boolean };
+  /** autobind、echo（本地输入镜像）、exitNotice（退出时的对话关闭提示）缺省均为开。 */
+  settings?: { chatId: string; ownerOpenId: string; autobind?: boolean; echo?: boolean; exitNotice?: boolean };
   pendingTopic?: { sessionId: string; title: string };
   bindings: RelayBinding[];
   receipts: Record<string, number>;
@@ -162,9 +162,13 @@ export class RelayGateway {
       ?? [...this.state.bindings].reverse().find((b) => b.sessionId === sessionId);
   }
 
-  /** register/ping/status 统一返回绑定与全局开关：终端据此决定是否镜像本地输入。 */
+  /** register/ping/status 统一返回绑定与全局开关：终端据此决定是否镜像本地输入、退出时是否推送关闭提示。 */
   private relayView(sessionId: string) {
-    return { binding: this.binding(sessionId), echo: this.state.settings?.echo !== false };
+    return {
+      binding: this.binding(sessionId),
+      echo: this.state.settings?.echo !== false,
+      exitNotice: this.state.settings?.exitNotice !== false,
+    };
   }
   private save() { writeRelayJson(this.statePath, this.state); }
 
@@ -194,6 +198,13 @@ export class RelayGateway {
       this.state.settings.echo = params.enabled;
       this.save();
       return { echo: this.state.settings.echo };
+    }
+    if (method === "exitNotice") {
+      if (!this.state.settings) throw new Error("请先在终端执行 /feishu relay setup <群chat_id> <你的open_id>。");
+      if (typeof params?.enabled !== "boolean") throw new Error("退出通知开关需要 on 或 off。");
+      this.state.settings.exitNotice = params.enabled;
+      this.save();
+      return { exitNotice: this.state.settings.exitNotice };
     }
     if (method === "autobindTopic") {
       if (!this.state.settings) return { created: false, reason: "unconfigured" };

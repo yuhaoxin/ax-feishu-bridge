@@ -21,6 +21,7 @@ export function feishuHelp(): string {
     "  /feishu relay setup <群chat_id> <你的open_id>   一次性配置接力目标话题群与授权账号（须为群主的 open_id）",
     "  /feishu relay autobind on|off       开关「新会话自动绑定话题」（默认开）；关闭时新会话不再建话题",
     "  /feishu relay echo on|off           开关「本地输入镜像到话题」（默认开）；关闭后只推送正式回复",
+    "  /feishu relay exit-notice on|off    开关「退出 TUI 时推送对话关闭消息」（默认开）",
     "  /feishu relay status                查看当前会话的绑定状态和输入镜像开关",
     "  /feishu relay push <文本>           向当前会话的绑定话题主动推送一条消息",
     "  /feishu relay unbind                解绑当前会话并永久退出自动绑定（不删历史与话题）",
@@ -38,6 +39,7 @@ export function relayHelp(): string {
     "  /feishu relay setup <群chat_id> <你的open_id>   配置目标话题群与授权账号；执行一次即可",
     "  /feishu relay autobind on|off       开关「新会话自动绑定话题」；默认开",
     "  /feishu relay echo on|off           开关「本地输入镜像到话题」；默认开",
+    "  /feishu relay exit-notice on|off    开关「退出 TUI 时向话题推送对话关闭消息」；默认开",
     "  /feishu relay status                查看当前会话绑定状态",
     "  /feishu relay push <文本>           向当前会话的绑定话题主动推送一条消息（最多 100000 字符）",
     "  /feishu relay unbind                解绑当前会话并永久退出自动绑定；旧话题继续拒绝执行"
