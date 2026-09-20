@@ -9,7 +9,7 @@ import { ROOT_DIR } from "../../feishu/config.ts";
 import { RelayGateway } from "./relay-gateway.ts";
 import { registerRelayExtension } from "./relay-extension.ts";
 import { feishuHelp } from "./feishu-help.ts";
-import { BRIDGE_PI_PATH, CHILD_SESSION_ENV, CONFIG_PI_PATH, DAEMON_LOG_PATH, DEBUG_PI_LOG_PATH, DEDUPE_PI_PATH, ensureRoot, loadConfig, mask, removePath, PI_SOURCE, setRuntimeSource, STATE_PI_PATH, writeJson } from "../../feishu/config.ts";
+import { BRIDGE_PI_PATH, CHILD_SESSION_ENV, CONFIG_PI_PATH, DAEMON_LOG_PATH, DEBUG_PI_LOG_PATH, DEDUPE_PI_PATH, ensureRoot, getRuntimeSource, loadConfig, mask, ompAgentDir, removePath, OMP_SOURCE, PI_SOURCE, setRuntimeSource, STATE_PI_PATH, writeJson } from "../../feishu/config.ts";
 import { debugLog } from "../../feishu/debug.ts";
 import { FeishuBridgeRuntime } from "../../feishu/bridge-runtime.ts";
 import { FeishuBridgeStore } from "../../feishu/bridge-store.ts";
@@ -38,15 +38,20 @@ import { PiConversationRuntime, handlePiMessageEnd } from "./PiConversationRunti
  */
 export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { extensionPath?: string }) {
   const extensionEntry = options?.extensionPath || fileURLToPath(import.meta.url);
-  // Pi 进程使用 Pi 自己的配置/状态/记录文件（默认即 Pi，显式声明便于维护）
-  setRuntimeSource(PI_SOURCE);
+  // Runtime 选择：daemon/env 显式声明走 omp（独立配置/状态/锁），默认 Pi。
+  // OMPFEISHU_* 是 omp 专属配置前缀（见 config.ts OMP_SOURCE），
+  // PI_FEISHU_DAEMON 沿用旧名以减少 daemon 匹配串的改动面。
+  const ompRuntime = process.env.OMPFEISHU_RUNTIME === "1";
+  setRuntimeSource(ompRuntime ? OMP_SOURCE : PI_SOURCE);
   if (process.env[CHILD_SESSION_ENV] === "1") {
     return;
   }
 
   // 模型可读写白名单配置（热更新 + 落盘）
   registerFeishuConfigTools(pi);
-  const relayEndpointPath = join(ROOT_DIR, "relay-endpoint.pi.json");
+  const relayEndpointPath = ompRuntime
+    ? join(ompAgentDir(), "feishu", "relay-endpoint.omp.json")
+    : join(ROOT_DIR, "relay-endpoint.pi.json");
   const relayCommand = process.env.PI_FEISHU_DAEMON === "1" ? undefined : registerRelayExtension(pi, relayEndpointPath);
   let relay: RelayGateway | undefined;
 
@@ -232,17 +237,29 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
   }
 
   function daemonSpec() {
-    const piBin = process.env.PI_BIN || "pi";
-    const args = [
-      "--mode", "rpc",
-      "--no-extensions",
-      "--no-skills",
-      "--no-prompt-templates",
-      "--no-themes",
-      "--no-context-files",
-      "--no-builtin-tools",
-      "-e", extensionEntry,
-    ];
+    // omp runtime 下 daemon 用 omp 拉起；omp 不识别 pi 的
+    // --no-prompt-templates/--no-themes/--no-context-files/--no-builtin-tools，
+    // 未识别 flag 会直接 process.exit(2)，对应能力用 --no-tools 覆盖。
+    const ompRuntime = getRuntimeSource().id === "omp";
+    const piBin = ompRuntime ? process.env.OMP_BIN || "omp" : process.env.PI_BIN || "pi";
+    const args = ompRuntime
+      ? [
+          "--mode", "rpc",
+          "--no-extensions",
+          "--no-skills",
+          "--no-tools",
+          "-e", extensionEntry,
+        ]
+      : [
+          "--mode", "rpc",
+          "--no-extensions",
+          "--no-skills",
+          "--no-prompt-templates",
+          "--no-themes",
+          "--no-context-files",
+          "--no-builtin-tools",
+          "-e", extensionEntry,
+        ];
     return { extensionPath: extensionEntry, piBin, args };
   }
 
@@ -594,9 +611,11 @@ function listProcesses() {
 }
 
 function looksLikeFeishuDaemon(command: string, extensionPath?: string) {
+  // omp runtime 的 daemon 用 --no-tools 替代 pi 的 --no-builtin-tools，
+  // 两种形态都按 feishu daemon 识别，保证残留进程回收在两侧都生效。
   const hasDaemonFlags = command.includes("--mode rpc")
     && command.includes("--no-extensions")
-    && command.includes("--no-builtin-tools");
+    && (command.includes("--no-builtin-tools") || command.includes("--no-tools"));
   if (!hasDaemonFlags) return false;
   if (extensionPath) return command.includes(extensionPath);
   return command.includes("feishu/index.ts");

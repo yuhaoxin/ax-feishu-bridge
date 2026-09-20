@@ -1,17 +1,28 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { CONFIG_PI_PATH, DEFAULT_CONFIG, ensureRoot, mask, writeJson } from "../../feishu/config.ts";
+import { CONFIG_PI_PATH, DEFAULT_CONFIG, ensureRoot, getRuntimeSource, mask, writeJson } from "../../feishu/config.ts";
 import { registerFeishuApp } from "../../feishu/app-register.ts";
 import type { Domain, FeishuConfig, GroupPolicy } from "../../feishu/types.ts";
+
+/** 当前 runtime 的配置文件路径：omp 写 config.omp.json，pi 写 config.pi.json */
+function configPathForRuntime() {
+  return getRuntimeSource().id === "omp"
+    ? getRuntimeSource().configPath
+    : CONFIG_PI_PATH;
+}
 
 export async function uiSelect<T extends string>(ctx: ExtensionCommandContext, title: string, options: Array<{ value: T; label: string }>, initialValue?: T): Promise<T> {
   const ui: any = ctx.ui;
   if (typeof ui.select !== "function") {
     throw new Error("Current UI does not support select prompts.");
   }
-  const labels = options.map((o) => o.label);
+  // omp 的 ui.select 需要 {id,label} 对象数组；pi 接受字符串数组。
+  const items = options.map((o) => ({ id: o.value, label: o.label }));
   const initialLabel = options.find((o) => o.value === initialValue)?.label;
-  const selectedLabel = await ui.select(title, labels, initialLabel ? { initialValue: initialLabel } : undefined);
-  const matched = options.find((o) => o.label === selectedLabel);
+  const selected = await ui.select(title, items, initialLabel ? { initialValue: initialLabel } : undefined);
+  const selectedId = typeof selected === "string" ? selected : selected?.id;
+  const selectedLabel = typeof selected === "string" ? selected : selected?.label;
+  const matched = options.find((o) => o.value === selectedId)
+    ?? options.find((o) => o.label === selectedLabel);
   if (!matched) {
     throw new Error("Selection cancelled.");
   }
@@ -84,10 +95,11 @@ export async function runSetup(ctx: ExtensionCommandContext) {
     reactEmoji: DEFAULT_CONFIG.reactEmoji,
     autoStart: true,
   };
-  writeJson(CONFIG_PI_PATH, config);
+  const configPath = configPathForRuntime();
+  writeJson(configPath, config);
 
   ctx.ui.notify(
-    `飞书配置已保存 / Feishu config saved\nPath: ${CONFIG_PI_PATH}\nApp ID: ${mask(appId)}\n群聊策略 / Group policy: ${groupPolicy}`,
+    `飞书配置已保存 / Feishu config saved\nPath: ${configPath}\nApp ID: ${mask(appId)}\n群聊策略 / Group policy: ${groupPolicy}`,
     "info",
   );
 

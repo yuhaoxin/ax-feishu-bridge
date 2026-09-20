@@ -7,6 +7,15 @@ import type { CardActionMode, Domain, FeishuConfig, GroupPolicy } from "./types.
 
 export const ROOT_DIR = join(homedir(), ".pi", "agent", "feishu");
 
+/** omp 的家目录：优先 OMP_AGENT_DIR，否则 ~/.omp/agent */
+export function ompAgentDir(): string {
+  const fromEnv = process.env.OMP_AGENT_DIR?.trim();
+  return fromEnv || join(homedir(), ".omp", "agent");
+}
+
+/** omp 数据目录：与 pi 完全隔离，避免共用配置/状态/锁/机器人连接 */
+export const OMP_ROOT = join(ompAgentDir(), "feishu");
+
 /** dsh 的家目录：优先 DSH_HOME 环境变量，否则 ~/.dsh */
 export function dshHome(): string {
   const fromEnv = process.env.DSH_HOME?.trim();
@@ -23,6 +32,14 @@ export const BRIDGE_PI_PATH = join(ROOT_DIR, "bridge.pi.json");
 export const DEDUPE_PI_PATH = join(ROOT_DIR, "dedupe.pi.json");
 export const DEBUG_PI_LOG_PATH = join(ROOT_DIR, "debug.pi.log");
 export const DAEMON_LOG_PATH = join(ROOT_DIR, "daemon.log");
+
+// ---------- omp 适配器专用路径 ----------
+export const CONFIG_OMP_PATH = join(OMP_ROOT, "config.omp.json");
+export const STATE_OMP_PATH = join(OMP_ROOT, "state.omp.json");
+export const BRIDGE_OMP_PATH = join(OMP_ROOT, "bridge.omp.json");
+export const DEDUPE_OMP_PATH = join(OMP_ROOT, "dedupe.omp.json");
+export const DEBUG_OMP_LOG_PATH = join(OMP_ROOT, "debug.omp.log");
+export const DAEMON_OMP_LOG_PATH = join(OMP_ROOT, "daemon.log");
 
 // ---------- Harness 适配器专用路径 ----------
 export const CONFIG_HARNESS_PATH = join(HARNESS_ROOT, "config.harness.json");
@@ -46,8 +63,8 @@ export const CHILD_SESSION_ENV = "PI_FEISHU_CHILD_SESSION";
  * 公共代码通过 loadConfig/debugLog 等自动使用当前 runtime 的文件。
  */
 export type RuntimeSource = {
-  id: "pi" | "harness";
-  /** 环境变量前缀：Pi 用 FEISHU_，Harness 用 HARNESS_ */
+  id: "pi" | "harness" | "omp";
+  /** 环境变量前缀：Pi 用 FEISHU_，Harness 用 HARNESS_，omp 用 OMPFEISHU_ */
   envPrefix: string;
   configPath: string;
   statePath: string;
@@ -76,13 +93,29 @@ export const HARNESS_SOURCE: RuntimeSource = {
   debugLogPath: DEBUG_HARNESS_LOG_PATH,
 };
 
+export const OMP_SOURCE: RuntimeSource = {
+  id: "omp",
+  envPrefix: "OMPFEISHU",
+  configPath: CONFIG_OMP_PATH,
+  statePath: STATE_OMP_PATH,
+  bridgePath: BRIDGE_OMP_PATH,
+  dedupePath: DEDUPE_OMP_PATH,
+  debugLogPath: DEBUG_OMP_LOG_PATH,
+};
+
 /** 默认 Pi（向后兼容：Pi 进程无需显式设置）。 */
 let currentSource: RuntimeSource = PI_SOURCE;
 
 export function setRuntimeSource(source: RuntimeSource) {
   currentSource = source;
-  // 运行时热更新配置跟随各自平台：Pi 住 ~/.pi，Harness 住 dsh 家目录
-  setRuntimeOverridesPath(source.id === "harness" ? join(HARNESS_ROOT, "runtime-overrides.json") : join(ROOT_DIR, "runtime-overrides.json"));
+  // 运行时热更新配置跟随各自平台：Pi 住 ~/.pi，omp 住 ~/.omp/agent，Harness 住 dsh 家目录
+  if (source.id === "harness") {
+    setRuntimeOverridesPath(join(HARNESS_ROOT, "runtime-overrides.json"));
+  } else if (source.id === "omp") {
+    setRuntimeOverridesPath(join(OMP_ROOT, "runtime-overrides.json"));
+  } else {
+    setRuntimeOverridesPath(join(ROOT_DIR, "runtime-overrides.json"));
+  }
 }
 
 export function getRuntimeSource(): RuntimeSource {
@@ -155,17 +188,23 @@ export const DEFAULT_CONFIG: Pick<
 };
 
 /**
- * 默认卡片回调端口：Pi 用 3001（历史默认），DSH 用 3002。
- * Pi 与 DSH 并行启用时如果都用 3001 会互相抢端口（EADDRINUSE），
+ * 默认卡片回调端口：Pi 用 3001（历史默认），omp 用 3002，DSH 用 3003。
+ * 多个 runtime 并行启用时如果都用 3001 会互相抢端口（EADDRINUSE），
  * 因此按 runtime 区分默认值，开箱即用即可共存。
  */
 export function defaultCardActionWebhookPort(): number {
-  return getRuntimeSource().id === "harness" ? 3002 : 3001;
+  const id = getRuntimeSource().id;
+  return id === "harness" ? 3003 : id === "omp" ? 3002 : 3001;
 }
 
 export function ensureRoot() {
-  if (getRuntimeSource().id === "harness") {
+  const id = getRuntimeSource().id;
+  if (id === "harness") {
     mkdirSync(HARNESS_ROOT, { recursive: true });
+    return;
+  }
+  if (id === "omp") {
+    mkdirSync(OMP_ROOT, { recursive: true });
     return;
   }
   mkdirSync(ROOT_DIR, { recursive: true });

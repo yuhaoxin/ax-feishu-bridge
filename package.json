@@ -63,6 +63,11 @@
       "./.pi/extensions/feishu/index.ts"
     ]
   },
+  "omp": {
+    "extensions": [
+      "./.pi/extensions/feishu/index.ts"
+    ]
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

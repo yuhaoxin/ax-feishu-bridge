@@ -163,11 +163,15 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     heartbeat.unref?.();
   }
 
-  pi.on("session_start", (event, context) => attach(context, AUTOBIND_REASONS.has(event.reason)));
-  pi.on("session_shutdown", async (event) => {
+  // omp 的 session_start/session_shutdown 事件没有 reason 字段；
+  // 新会话 autobind 改由首条 input 的 pendingAuto 逻辑完成（初始即为待绑定），
+  // /new、/resume、/fork 后由 session_switch 重新置为待绑定；首次启动时
+  // attach() 的 autoEligible 直接尝试。退出提示在 omp 上改为无条件推送，
+  // 网关或网络异常时仍有 EXIT_NOTICE_TIMEOUT_MS 兜底，不会卡退出。
+  pi.on("session_start", (_event, context) => attach(context, AUTOBIND_REASONS.has(process.env.PI_FEISHU_RELAY_NEW ?? "startup")));
+  pi.on("session_shutdown", async () => {
     const active = client;
-    // /new、/resume、/fork、/reload 也触发本事件，但话题仍由后继会话使用：只处理真正退出。
-    if (event.reason === "quit" && active?.binding?.enabled && active.exitNotice) {
+    if (active?.binding?.enabled && active.exitNotice) {
       await Promise.race([
         enqueueFinal((current) => current.request("push", { text: EXIT_NOTICE }, EXIT_NOTICE_TIMEOUT_MS)),
         delay(EXIT_NOTICE_TIMEOUT_MS, undefined, { ref: false }),
@@ -203,13 +207,9 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     return { action: "continue" };
   });
 
-  pi.on("session_info_changed", (event) => {
-    const active = client;
-    if (!ctx || !active?.connected || !active.binding?.enabled) return;
-    // 名字清空时回退到首条输入，否则标题会一直挂着旧名字。
-    const title = relayTitle(event.name, active.binding.firstInput, ctx.cwd);
-    void active.request("rename", { title }).catch(notify);
-  });
+  // omp 没有 session_info_changed / session_switch 事件：会话改名不再同步
+  // 到话题标题，/new、/resume、/fork 后也不自动重建绑定。话题标题只由
+  // autobind 时的首条输入/会话名决定；需要换绑时手动 /feishu relay 重连。
 
   pi.on("agent_start", () => { turnId = randomUUID(); replies = 0; answered = false; });
   pi.on("message_end", (event) => {

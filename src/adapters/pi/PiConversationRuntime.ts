@@ -10,7 +10,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { FeishuBridgeRuntime, BridgeJobEvent } from "../../feishu/bridge-runtime.ts";
-import { CHILD_SESSION_ENV, ensureRoot, readJson, STATE_PATH, writeJson } from "../../feishu/config.ts";
+import { CHILD_SESSION_ENV, ensureRoot, getRuntimeSource, readJson, STATE_PATH, writeJson } from "../../feishu/config.ts";
 import { debugLog } from "../../feishu/debug.ts";
 import { waitForPrompt } from "../../feishu/prompt-timeout.ts";
 import type { ResumeScope, ResumeSessionPage } from "../../feishu/cards.ts";
@@ -640,9 +640,21 @@ export class PiConversationRuntime implements ConversationRuntime {
     const selected = this.state.models?.[key];
     const modelRuntime = await this.getModelRuntime();
     const model = selected ? modelRuntime.getModel(selected.provider, selected.id) : undefined;
-    const sessionManager = existingFile && existsSync(existingFile)
-      ? SessionManager.open(existingFile, undefined, workspaceCwd)
-      : SessionManager.create(workspaceCwd);
+    let sessionManager: SessionManager;
+    if (existingFile && existsSync(existingFile)) {
+      if (getRuntimeSource().id === "omp") {
+        // omp：第三参是 SessionStorage，cwd 走 options.initialCwd。omp 的
+        // open 未导出 4 参重载类型（运行时支持），此处用命名别名断言。
+        const ompOpen = SessionManager.open as
+          (filePath: string, sessionDir?: undefined, storage?: undefined, options?: { initialCwd?: string }) => SessionManager;
+        sessionManager = ompOpen(existingFile, undefined, undefined, { initialCwd: workspaceCwd });
+      } else {
+        // 上游 pi：第三参是 cwdOverride
+        sessionManager = SessionManager.open(existingFile, undefined, workspaceCwd);
+      }
+    } else {
+      sessionManager = SessionManager.create(workspaceCwd);
+    }
 
     const loader = new DefaultResourceLoader({
       cwd: workspaceCwd,
@@ -671,7 +683,12 @@ export class PiConversationRuntime implements ConversationRuntime {
       resourceLoader: loader,
     } as any);
 
-    await session.bindExtensions({});
+    // 上游 pi 在 AgentSession 上提供 bindExtensions；omp 没有该方法，
+    // 扩展绑定由宿主进程自己完成，跳过即可。
+    const bindable = session as Partial<Pick<AgentSession, "bindExtensions">>;
+    if (typeof bindable.bindExtensions === "function") {
+      await bindable.bindExtensions({});
+    }
     this.bridge?.attachSession(key, session.sessionId);
     // 会话级长期订阅：保证 text_delta 在 prompt 期间一定能收到
     session.subscribe((event: any) => {
@@ -763,9 +780,21 @@ async function createModelRuntimeAdapter(): Promise<ModelRuntimeAdapter> {
     };
   }
 
+  // omp：ModelRegistry 无静态 create，用构造函数 + discoverAuthStorage()
   if (typeof sdk.AuthStorage?.create === "function" && typeof sdk.ModelRegistry?.create === "function") {
     const authStorage = sdk.AuthStorage.create();
     const modelRegistry = sdk.ModelRegistry.create(authStorage);
+    return {
+      getModel: (provider, id) => modelRegistry.find(provider, id),
+      hasConfiguredAuth: (model) => modelRegistry.hasConfiguredAuth(model),
+      getAvailable: async () => [...await modelRegistry.getAvailable()],
+      sessionOptions: { authStorage, modelRegistry },
+    };
+  }
+
+  if (typeof sdk.ModelRegistry === "function" && typeof sdk.discoverAuthStorage === "function") {
+    const authStorage = await sdk.discoverAuthStorage();
+    const modelRegistry = new sdk.ModelRegistry(authStorage);
     return {
       getModel: (provider, id) => modelRegistry.find(provider, id),
       hasConfiguredAuth: (model) => modelRegistry.hasConfiguredAuth(model),

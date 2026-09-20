@@ -2,10 +2,34 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { debugLog } from "./debug.ts";
+import { ompAgentDir, getRuntimeSource } from "./config.ts";
 
 /** 兼容旧版锁（未按 appId 区分时的固定 key）。 */
 const LEGACY_LOCK_KEY = "pi-feishu-lark.feishu-gateway";
 const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
+
+/**
+ * 锁文件选址：按当前 runtime source 区分。
+ * pi 沿用老位置（~/.pi/agent/locks.json），omp 用 ~/.omp/agent/locks.json，
+ * 纯 dsh 环境放进 dsh 家目录，不再凭空创建 ~/.pi。
+ * omp 与 pi 各持一份锁文件：同一机器人在两个 runtime 里的连接互不协商，
+ * 用户需自行保证同一 appId 只在一个 runtime 启用（跨 runtime 抢同一
+ * 飞书长连接时，两端都会显示连接成功，实际事件只会送达其中一边）。
+ */
+let locksPath: string | undefined;
+
+function resolveLocksPath(): string {
+  let runtimeId: "pi" | "harness" | "omp" = "pi";
+  try {
+    runtimeId = getRuntimeSource().id;
+  } catch {
+    // currentSource 尚未初始化时按 pi 兜底
+  }
+  if (runtimeId === "omp") return join(ompAgentDir(), "locks.json");
+  if (existsSync(PI_AGENT_DIR)) return join(PI_AGENT_DIR, "locks.json");
+  const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), ".dsh");
+  return join(dshHome, "locks.json");
+}
 const LOCK_STALE_MS = 30_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_ATTEMPTS = 40;
@@ -19,18 +43,10 @@ function lockKeyFor(appId: string | undefined) {
   return appId ? `ax-feishu-bridge.gateway.${appId}` : LEGACY_LOCK_KEY;
 }
 
-/**
- * 锁文件选址：机器上有 Pi 数据目录时沿用老位置，保证 Pi 与 Harness
- * 仍能互相协商同一个机器人的连接；纯 dsh 环境放进 dsh 家目录，
- * 不再凭空创建 ~/.pi。
- */
-function resolveLocksPath(): string {
-  if (existsSync(PI_AGENT_DIR)) return join(PI_AGENT_DIR, "locks.json");
-  const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), ".dsh");
-  return join(dshHome, "locks.json");
+function currentLocksPath(): string {
+  locksPath ??= resolveLocksPath();
+  return locksPath;
 }
-
-const LOCKS_PATH = resolveLocksPath();
 
 export type GatewayOwner = {
   key: string;
@@ -157,7 +173,7 @@ export function readGatewayOwner(appId?: string): GatewayOwner | undefined {
 }
 
 export function gatewayLockPath() {
-  return LOCKS_PATH;
+  return currentLocksPath();
 }
 
 function asGatewayOwner(value: unknown, expectedKey: string): GatewayOwner | undefined {
@@ -191,22 +207,24 @@ function randomToken() {
 }
 
 function readLocksFile(): LocksFile {
+  const path = currentLocksPath();
   try {
-    if (!existsSync(LOCKS_PATH)) return {};
-    return JSON.parse(readFileSync(LOCKS_PATH, "utf8")) as LocksFile;
+    if (!existsSync(path)) return {};
+    return JSON.parse(readFileSync(path, "utf8")) as LocksFile;
   } catch {
     return {};
   }
 }
 
 function writeLocksFile(locks: LocksFile) {
-  mkdirSync(dirname(LOCKS_PATH), { recursive: true });
-  writeFileSync(LOCKS_PATH, `${JSON.stringify(locks, null, 2)}\n`, "utf8");
+  const path = currentLocksPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(locks, null, 2)}\n`, "utf8");
 }
 
 async function withLocksFileLock<T>(fn: () => T | Promise<T>): Promise<T> {
-  const lockPath = `${LOCKS_PATH}.lock`;
-  mkdirSync(dirname(LOCKS_PATH), { recursive: true });
+  const lockPath = `${currentLocksPath()}.lock`;
+  mkdirSync(dirname(currentLocksPath()), { recursive: true });
 
   for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
     if (tryAcquireFileLock(lockPath)) {
