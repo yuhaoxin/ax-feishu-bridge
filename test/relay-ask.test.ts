@@ -86,7 +86,13 @@ test("接力 ask：多选题必须点提交才算答完", async (t) => {
     messageId: "om_card1", chatId: "oc_test", operatorOpenId: "ou_owner",
     value: { action: ASK_ACTION, runId: "r2", questionId: "q1", kind: "toggle", label },
   });
-  await toggle("A");
+  // 勾选后卡片必须仍带提交入口，否则用户在飞书侧无法结束多选题（曾把该题当已答渲染）
+  const toggled = await toggle("A");
+  const labels = (toggled as any).elements
+    .filter((element: any) => element.tag === "action")
+    .flatMap((element: any) => element.actions.map((action: any) => action.text.content));
+  assert.ok(labels.some((label: string) => String(label).includes("提交")), `勾选后要有提交按钮，实际：${JSON.stringify(labels)}`);
+  assert.ok(!String(JSON.stringify(toggled)).includes("已选："), "勾选未提交时不能显示成已作答");
   await toggle("B");
   const settledEarly = await Promise.race([ask.then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 50))]);
   assert.equal(settledEarly, false, "未提交前不能结束提问");

@@ -42,6 +42,8 @@ export type AskCardState = {
   runId: string;
   questions: AskQuestion[];
   answers: ReadonlyMap<string, AskAnswer>;
+  /** 已提交的多选题；有勾选但未提交时必须继续显示按钮和提交入口。 */
+  submitted: ReadonlySet<string>;
   status: AskCardStatus;
   /** 等待用户在话题里回复文本的目标：其他答案或备注。 */
   awaiting?: { questionId: string; kind: "other" | "note" };
@@ -133,7 +135,9 @@ export function buildAskCard(state: AskCardState): object {
     if (index > 0) elements.push({ tag: "hr" });
     elements.push({ tag: "div", text: { tag: "lark_md", content: questionTitle(question) } });
     const answer = state.answers.get(question.id);
-    if (isAnswered(answer)) {
+    // 多选题勾选后仍算未答完：卡片必须继续显示按钮与「提交」，否则用户在卡上无法结束这一题。
+    const settled = isAnswered(answer) && (!question.multi || state.submitted.has(question.id));
+    if (settled) {
       elements.push({ tag: "div", text: { tag: "lark_md", content: answeredText(answer!) } });
       return;
     }
@@ -177,6 +181,12 @@ export function buildAskCard(state: AskCardState): object {
     secondary.push(askButton(state.runId, question.id, "other", "✏️ 其他（回复文本）"));
     secondary.push(askButton(state.runId, question.id, "note", "📝 补充说明"));
     elements.push({ tag: "action", actions: secondary });
+    if (question.multi && answer?.selectedOptions?.length) {
+      elements.push({
+        tag: "div",
+        text: { tag: "lark_md", content: `⏳ 已勾选 ${answer.selectedOptions.length} 项，点上面的「提交」才会结束这一题。` },
+      });
+    }
   });
 
   const footer = statusText(state);
@@ -277,6 +287,11 @@ function askButton(
 }
 
 function statusText(state: AskCardState): string | undefined {
+  if (state.status === "pending" && state.questions.length > 1) {
+    const done = state.questions.filter((question) => isAnswered(state.answers.get(question.id)) && (!question.multi || state.submitted.has(question.id))).length;
+    const unsubmitted = state.questions.filter((question) => question.multi && state.answers.get(question.id)?.selectedOptions?.length && !state.submitted.has(question.id)).length;
+    return `进度：已答 ${done}/${state.questions.length} 题。${unsubmitted ? "有已勾选但未提交的多选题。" : ""}`;
+  }
   if (state.status === "done") return "✅ 问题已全部回答，答案已返回终端会话。";
   if (state.status === "timeout") return "⏰ 等待超时，未回答的问题已按推荐项自动作答。";
   if (state.status === "terminal") return "🖥 已在终端回答，本卡片已失效。";

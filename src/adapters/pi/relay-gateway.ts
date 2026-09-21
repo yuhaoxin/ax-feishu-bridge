@@ -390,7 +390,7 @@ export class RelayGateway {
     const ask = this.pendingAsks.get(parsed.runId);
     if (!ask || ask.done) {
       debugLog("feishu.relay.ask.action_stale", { runId: parsed.runId, questionId: parsed.questionId, kind: parsed.kind });
-      return buildAskCard({ runId: parsed.runId, questions: [], answers: new Map<string, AskAnswer>(), status: "expired" });
+      return buildAskCard({ runId: parsed.runId, questions: [], answers: new Map<string, AskAnswer>(), submitted: new Set<string>(), status: "expired" });
     }
     const question = ask.questions.find((item) => item.id === parsed.questionId);
     if (!question) return buildAskCard(this.askCardState(ask, "pending"));
@@ -490,6 +490,7 @@ export class RelayGateway {
       runId: ask.runId,
       questions: ask.questions,
       answers: ask.answers,
+      submitted: ask.submitted,
       status,
       awaiting: status === "pending" ? ask.awaiting : undefined,
     };
