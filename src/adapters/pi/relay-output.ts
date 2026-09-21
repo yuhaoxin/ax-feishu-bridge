@@ -14,6 +14,8 @@ export type RelayTransport = {
   createRelayTopic(chatId: string, title: string): Promise<{ threadId: string; rootMessageId: string }>;
   replyRelayText(rootMessageId: string, text: string): Promise<void>;
   replyRelayCard(rootMessageId: string, card: object): Promise<string>;
+  /** 原地刷新已发出的交互卡（ask 提问卡的作答状态）。 */
+  updateRelayCard(messageId: string, card: object): Promise<void>;
   renameRelayTitle(rootMessageId: string, title: string): Promise<void>;
 };
 

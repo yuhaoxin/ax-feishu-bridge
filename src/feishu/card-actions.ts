@@ -21,9 +21,14 @@ import type { FeishuCardAction } from "./types.ts";
 export function createCardActionHandler(
   conversations: ConversationRuntime,
   getTransport: () => FeishuTransport | undefined,
+  /** 接力 ask 卡片的回调；返回卡片表示已处理并原地刷新，返回 undefined 表示不是它的事件。 */
+  onRelayAskAction?: (action: FeishuCardAction) => Promise<object | undefined>,
 ) {
   return async (action: FeishuCardAction) => {
     const transport = getTransport();
+    // ask 卡片属于接力话题，先于后台会话动作路由：value 里带 ask 的 runId 才认。
+    const askCard = await onRelayAskAction?.(action);
+    if (askCard) return askCard;
     const copy = parseCopyMarkdownActionValue(action.value);
     if (copy) {
       const source = transport?.getMarkdownCopySource(copy.copySourceId);

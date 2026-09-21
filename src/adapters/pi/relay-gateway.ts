@@ -2,7 +2,20 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { dirname } from "node:path";
-import type { FeishuMessage } from "../../feishu/types.ts";
+import { loadConfig } from "../../feishu/config.ts";
+import {
+  buildAskCard,
+  emptyAnswer,
+  isAnswered,
+  parseAskActionValue,
+  parseAskQuestions,
+  resolveTimeoutAnswer,
+  type AskActionValue,
+  type AskAnswer,
+  type AskCardStatus,
+  type AskQuestion,
+} from "../../feishu/ask-card.ts";
+import type { FeishuCardAction, FeishuMessage } from "../../feishu/types.ts";
 import { parseMessageInput } from "../../feishu/messages.ts";
 import { RelayPeer } from "./relay-rpc.ts";
 import { sendRelayAnswer, type RelayBinding, type RelayTransport } from "./relay-output.ts";
@@ -17,6 +30,28 @@ export type RelayState = {
   receipts: Record<string, number>;
   /** 主动退出接力的会话：不再自动绑定；旧话题记录保留以持续拦截。 */
   optOut: string[];
+};
+
+/**
+ * 一次等待飞书作答的提问。答案在内存里累积：进程重启后卡片上的旧按钮会回「已结束」，
+ * 不会把上一轮的答案写进新一轮的会话。
+ */
+type PendingAsk = {
+  runId: string;
+  sessionId: string;
+  binding: RelayBinding;
+  questions: AskQuestion[];
+  answers: Map<string, AskAnswer>;
+  /** 多选题必须点「提交」才算答完，其余题型累计到答案即算。 */
+  submitted: Set<string>;
+  done: boolean;
+  timeoutMs: number;
+  notifyMs: number;
+  cardMessageId?: string;
+  awaiting?: { questionId: string; kind: "other" | "note" };
+  notifyTimer?: NodeJS.Timeout;
+  hardTimer?: NodeJS.Timeout;
+  resolve: (value: { answers?: Record<string, AskAnswer> }) => void;
 };
 
 export function writeRelayJson(path: string, value: unknown) {
@@ -34,6 +69,7 @@ export class RelayGateway {
   private sessions = new Map<string, RelayPeer>();
   private state: RelayState;
   private control: Promise<unknown> = Promise.resolve();
+  private pendingAsks = new Map<string, PendingAsk>();
 
   constructor(
     private readonly statePath: string,
@@ -41,6 +77,8 @@ export class RelayGateway {
     appId: string,
     private readonly transport: RelayTransport,
     private readonly isBackendSession: (sessionId: string) => Promise<boolean> = async () => false,
+    /** ask 等待上限与催单阈值（毫秒），缺省读取飞书配置；注入点让测试不必依赖进程级配置。 */
+    private readonly askLimits: () => { timeoutMs: number; notifyMs: number } = relayAskLimits,
   ) {
     const parsed: any = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { version: 2, appId, bindings: [], receipts: {}, optOut: [] };
     this.state = parsed;
@@ -87,6 +125,9 @@ export class RelayGateway {
           await sendRelayAnswer(this.transport, binding, text);
           return { delivered: true };
         }
+        // ask 在等待回答期间必须悬空，不能进串行队列：否则会在用户作答前堵住后续所有接力操作。
+        if (method === "ask") return this.handleAsk(id, params);
+        if (method === "askCancel") return this.handleAskCancel(id, params);
         // 配置及绑定变更只有网关写入，串行执行避免重复创建话题或相互覆盖。
         const work = this.control.then(async () => {
           if (!peer.connected || this.sessions.get(id) !== peer) throw new Error("当前终端已离线。");
@@ -96,7 +137,10 @@ export class RelayGateway {
         return work;
       }, () => {
         this.peers.delete(peer);
-        if (sessionId && this.sessions.get(sessionId) === peer) this.sessions.delete(sessionId);
+        if (sessionId && this.sessions.get(sessionId) === peer) {
+          this.sessions.delete(sessionId);
+          this.expireAsks(sessionId);
+        }
       });
       this.peers.add(peer);
       socket.setTimeout(35_000, () => peer.close());
@@ -141,6 +185,9 @@ export class RelayGateway {
       await this.transport.replyRelayText(binding.rootMessageId, "接力话题目前仅接收文本消息，请在终端处理附件。");
       return true;
     }
+    // 提问等待自由文本时优先消费：否则这段文字会作为 steer 送进会话，答不到问题上。
+    const awaiting = this.pendingAskAwaiting(binding);
+    if (awaiting) return this.recordAskText(awaiting, input.text.trim());
     try {
       const result = await peer.request("input", { sessionId: binding.sessionId, messageId: msg.messageId, text: input.text }, 8_000);
       if (result?.accepted !== true) {
@@ -151,6 +198,31 @@ export class RelayGateway {
     } catch {
       await this.transport.replyRelayText(binding.rootMessageId, "未确认 Pi TUI 是否接收，消息不会自动重试。请检查终端后再决定是否重发。");
     }
+    return true;
+  }
+
+  /** 当前话题里正在等文本作答的提问（同会话可能绑定多个话题，需按话题根消息区分）。 */
+  private pendingAskAwaiting(binding: RelayBinding): PendingAsk | undefined {
+    for (const ask of this.pendingAsks.values()) {
+      if (ask.done || !ask.awaiting) continue;
+      if (ask.binding.rootMessageId === binding.rootMessageId) return ask;
+    }
+    return undefined;
+  }
+
+  /** 把话题里的文本当成提问答案消费，返回 true 表示已消费（不再送进会话）。 */
+  private recordAskText(ask: PendingAsk, text: string): boolean {
+    const awaiting = ask.awaiting!;
+    const current = ask.answers.get(awaiting.questionId) ?? emptyAnswer();
+    if (awaiting.kind === "note") {
+      ask.answers.set(awaiting.questionId, { ...current, note: text });
+    } else {
+      ask.answers.set(awaiting.questionId, { ...current, customInput: text });
+      ask.submitted.add(awaiting.questionId);
+    }
+    ask.awaiting = undefined;
+    if (ask.questions.every((question) => this.askQuestionDone(ask, question))) this.settleAsk(ask, "done");
+    else this.refreshAskCard(ask, "pending");
     return true;
   }
 
@@ -251,6 +323,180 @@ export class RelayGateway {
     }
     throw new Error("未知的接力操作。");
   }
+
+  /** 终端 ask 工具的提问：把问题发到绑定话题的交互卡并等待回答。 */
+  private async handleAsk(sessionId: string, params: unknown): Promise<{ answers?: Record<string, AskAnswer> }> {
+    const raw = asParams(params);
+    const runId = requireString(raw?.runId, 200);
+    const binding = this.binding(sessionId);
+    if (!binding?.enabled) throw new Error("当前会话没有启用的绑定话题，提问未发到飞书。");
+    if (this.pendingAsks.has(runId)) throw new Error("同一个提问 ID 已存在，拒绝重复发卡。");
+    const questions = parseAskQuestions(raw?.questions);
+    const limits = this.askLimits();
+    const pending: PendingAsk = {
+      runId,
+      sessionId,
+      binding,
+      questions,
+      answers: new Map<string, AskAnswer>(),
+      submitted: new Set<string>(),
+      done: false,
+      timeoutMs: limits.timeoutMs,
+      notifyMs: limits.notifyMs,
+      resolve: () => {},
+    };
+    const resolution = new Promise<{ answers?: Record<string, AskAnswer> }>((resolve) => {
+      pending.resolve = resolve;
+    });
+    this.pendingAsks.set(runId, pending);
+    try {
+      pending.cardMessageId = await this.transport.replyRelayCard(binding.rootMessageId, buildAskCard(this.askCardState(pending, "pending")));
+    } catch (error) {
+      // 发卡失败必须清掉等待项，否则同名 runId 会一直占位，且终端侧无法回退到对话框。
+      this.pendingAsks.delete(runId);
+      throw error;
+    }
+    this.armAskTimers(pending);
+    return resolution;
+  }
+
+  /** 终端侧已作答（或已取消）时收回飞书卡片，避免继续等一个不会来的回答。 */
+  private async handleAskCancel(sessionId: string, params: unknown): Promise<{ ok: boolean }> {
+    const raw = asParams(params);
+    const ask = this.pendingAsks.get(requireString(raw?.runId, 200));
+    if (!ask || ask.sessionId !== sessionId) return { ok: false };
+    this.settleAsk(ask, raw?.timeout === true ? "timeout" : "terminal");
+    return { ok: true };
+  }
+
+  /**
+   * 飞书卡片回调里的 ask 操作。返回卡片 JSON 表示原地刷新被点击的卡片；
+   * 返回 undefined 表示这不是 ask 回调，交回其他处理链。
+   */
+  async handleAskAction(action: FeishuCardAction): Promise<object | undefined> {
+    const parsed = parseAskActionValue(action.value);
+    if (!parsed) return undefined;
+    // 与文本消息同一套权限口径：只认授权账号在绑定群里的操作。
+    if (action.operatorOpenId !== this.state.settings?.ownerOpenId) return undefined;
+    if (action.chatId && action.chatId !== this.state.settings?.chatId) return undefined;
+    const ask = this.pendingAsks.get(parsed.runId);
+    if (!ask || ask.done) return buildAskCard({ runId: parsed.runId, questions: [], answers: new Map<string, AskAnswer>(), status: "expired" });
+    const question = ask.questions.find((item) => item.id === parsed.questionId);
+    if (!question) return buildAskCard(this.askCardState(ask, "pending"));
+    this.applyAskAction(ask, question, parsed);
+    if (ask.questions.every((item) => this.askQuestionDone(ask, item))) {
+      this.settleAsk(ask, "done");
+      return buildAskCard(this.askCardState(ask, "done"));
+    }
+    return buildAskCard(this.askCardState(ask, "pending"));
+  }
+
+  private applyAskAction(ask: PendingAsk, question: AskQuestion, action: AskActionValue) {
+    const current = ask.answers.get(question.id) ?? emptyAnswer();
+    if (action.kind === "option" || action.kind === "toggle") {
+      if (!action.label || !question.options.some((option) => option.label === action.label)) return;
+      const selectedOptions = action.kind === "option"
+        ? [action.label]
+        : current.selectedOptions.includes(action.label)
+          ? current.selectedOptions.filter((label) => label !== action.label)
+          : [...current.selectedOptions, action.label];
+      ask.answers.set(question.id, { ...current, selectedOptions });
+      if (action.kind === "option") ask.submitted.add(question.id);
+      ask.awaiting = undefined;
+      return;
+    }
+    if (action.kind === "submit") {
+      if (isAnswered(current)) ask.submitted.add(question.id);
+      return;
+    }
+    // 其他/备注：等用户在话题里回文本，handleMessage 会优先把这段文字当答案消费。
+    ask.awaiting = { questionId: question.id, kind: action.kind };
+  }
+
+  /** 多选题必须显式提交才算答完；单选与自由输入点按即算。 */
+  private askQuestionDone(ask: PendingAsk, question: AskQuestion) {
+    return isAnswered(ask.answers.get(question.id)) && (!question.multi || ask.submitted.has(question.id));
+  }
+
+  private armAskTimers(ask: PendingAsk) {
+    if (ask.notifyMs > 0) {
+      ask.notifyTimer = setTimeout(() => {
+        void this.transport
+          .replyRelayText(ask.binding.rootMessageId, `⏳ 提问已等待 ${Math.round(ask.notifyMs / 1000)} 秒，请在上一条卡片里作答。`)
+          .catch(() => {});
+      }, ask.notifyMs);
+      ask.notifyTimer.unref?.();
+    }
+    if (ask.timeoutMs > 0) {
+      ask.hardTimer = setTimeout(() => {
+        for (const question of ask.questions) ask.answers.set(question.id, resolveTimeoutAnswer(question, ask.answers.get(question.id)));
+        this.settleAsk(ask, "timeout");
+      }, ask.timeoutMs);
+      ask.hardTimer.unref?.();
+    }
+  }
+
+  /** 结束一次提问：清计时器、刷新卡片、把答案交回终端。重复调用无副作用。 */
+  private settleAsk(ask: PendingAsk, status: AskCardStatus) {
+    if (ask.done) return;
+    ask.done = true;
+    if (ask.notifyTimer) clearTimeout(ask.notifyTimer);
+    if (ask.hardTimer) clearTimeout(ask.hardTimer);
+    ask.notifyTimer = undefined;
+    ask.hardTimer = undefined;
+    this.pendingAsks.delete(ask.runId);
+    this.refreshAskCard(ask, status);
+    ask.resolve({ answers: this.askAnswers(ask) });
+  }
+
+  private refreshAskCard(ask: PendingAsk, status: AskCardStatus) {
+    const cardMessageId = ask.cardMessageId;
+    if (!cardMessageId) return;
+    void this.transport.updateRelayCard(cardMessageId, buildAskCard(this.askCardState(ask, status))).catch(() => {});
+  }
+
+  /** 终端连接断开时结束该会话的提问：没有终端接收答案，继续等只会把卡片和发送方一起困住。 */
+  private expireAsks(sessionId: string | undefined) {
+    if (!sessionId) return;
+    for (const ask of [...this.pendingAsks.values()]) {
+      if (ask.sessionId !== sessionId) continue;
+      ask.done = true;
+      if (ask.notifyTimer) clearTimeout(ask.notifyTimer);
+      if (ask.hardTimer) clearTimeout(ask.hardTimer);
+      this.pendingAsks.delete(ask.runId);
+      this.refreshAskCard(ask, "expired");
+      ask.resolve({});
+    }
+  }
+
+  private askAnswers(ask: PendingAsk): Record<string, AskAnswer> {
+    return Object.fromEntries(ask.questions.map((question) => [question.id, ask.answers.get(question.id) ?? emptyAnswer()]));
+  }
+
+  private askCardState(ask: PendingAsk, status: AskCardStatus) {
+    return {
+      runId: ask.runId,
+      questions: ask.questions,
+      answers: ask.answers,
+      status,
+      awaiting: status === "pending" ? ask.awaiting : undefined,
+    };
+  }
+}
+
+/** ask 的等待上限与催单阈值：飞书配置里 askTimeoutSec / askNotifySec 为秒，0 表示关闭。 */
+function relayAskLimits(): { timeoutMs: number; notifyMs: number } {
+  const config = loadConfig();
+  return {
+    timeoutMs: Math.max(0, config?.askTimeoutSec ?? 0) * 1000,
+    notifyMs: Math.max(0, config?.askNotifySec ?? 0) * 1000,
+  };
+}
+
+/** 只做「是普通对象」这一层收窄；字段一律用现有校验函数逐个检查。 */
+function asParams(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
 }
 
 export function requireString(value: unknown, max: number): string {

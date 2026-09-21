@@ -1,7 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, AgentToolUpdateCallback, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import {
+  parseAskQuestions,
+  resolveTimeoutAnswer,
+  formatAskDetails,
+  formatAskText,
+  type AskAnswer,
+  type AskQuestion,
+  type AskResult,
+} from "../../feishu/ask-card.ts";
+import { loadConfig } from "../../feishu/config.ts";
 import { RelayClient } from "./relay-client.ts";
 import { relayHelp } from "./feishu-help.ts";
 
@@ -331,6 +341,88 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     },
   });
 
+  /**
+   * 遮蔽内置 ask：接力绑定后问题同时发到飞书话题与终端对话框，任一侧先作答即返回；
+   * 未绑定时委托原生同名工具，TUI 用户的使用体验完全不变。
+   * 只接管本接力会话，子 agent 等其它会话仍走原生行为。
+   */
+  pi.registerTool({
+    name: "ask",
+    label: "Ask",
+    description:
+      "Prompts the user for one or more option-picker or free-form answers. 接力绑定后问题会同时出现在飞书话题与终端，任一侧先作答即返回；未绑定时使用终端原生对话框。",
+    parameters: Type.Object({
+      questions: Type.Array(
+        Type.Object({
+          id: Type.String({ description: "Stable identifier used in multi-question results." }),
+          question: Type.String({ description: "Prompt text shown to the user." }),
+          options: Type.Array(
+            Type.Union([
+              Type.String(),
+              Type.Object({
+                label: Type.String(),
+                description: Type.Optional(Type.String()),
+                preview: Type.Optional(Type.String()),
+              }),
+            ]),
+            { description: "Picker choices; 2–5 options are typical." },
+          ),
+          header: Type.Optional(Type.String()),
+          multi: Type.Optional(Type.Boolean()),
+          recommended: Type.Optional(Type.Number()),
+        }),
+        { minItems: 1 },
+      ),
+    }),
+    // 原生 ask 是独占工具（同批只跑它一个），宿主只提供 sequential/parallel，取更接近的一项。
+    executionMode: "sequential",
+    async execute(_id, params, signal, onUpdate, context) {
+      if (!context.hasUI) {
+        // 与原生一致：没有交互界面时中止本轮，而不是挂在没人能回答的问题上。
+        context.abort();
+        throw new Error("Ask tool requires interactive mode");
+      }
+      const questions = parseAskQuestions(params.questions);
+      // 工具自身的 abort 信号可能缺省（宿主不传），统一收敛到内部 controller 上，对话框才有稳定的取消入口。
+      const controller = new AbortController();
+      const onToolAbort = () => controller.abort();
+      signal?.addEventListener("abort", onToolAbort, { once: true });
+      try {
+        const active = client;
+        const bound =
+          active?.connected === true &&
+          active.binding?.enabled === true &&
+          context.sessionManager.getSessionId() === sessionId;
+        if (!bound) {
+          const native = nativeAskInvoker(context);
+          if (native) return await native(params, { signal, onUpdate });
+          const fallback = await runTuiChannel(context, questions, controller.signal);
+          if (!fallback) askCancelled(context);
+          return askToolResult(fallback.results);
+        }
+        const timeoutMs = Math.max(0, loadConfig()?.askTimeoutSec ?? 0) * 1000;
+        const runId = randomUUID();
+        const feishu = active.request("ask", { runId, questions }, timeoutMs > 0 ? timeoutMs + 30_000 : 24 * 60 * 60 * 1000)
+          .then((response) => {
+            const results = readAskAnswers(response, questions);
+            return results ? { source: "feishu" as const, results, timedOut: results.some((item) => item.answer.timedOut === true) } : undefined;
+          })
+          .catch(() => undefined);
+        const tui = withAskTimeout(runTuiChannel(context, questions, controller.signal), timeoutMs, questions, () => controller.abort());
+        const winner = await raceFirst([feishu, tui]);
+        if (winner?.source === "feishu") controller.abort();
+        else if (winner) void active.request("askCancel", { runId, timeout: winner.timedOut === true }, 8_000).catch(() => {});
+        if (!winner) {
+          void active.request("askCancel", { runId }, 8_000).catch(() => {});
+          askCancelled(context);
+        }
+        return askToolResult(winner.results);
+      } finally {
+        signal?.removeEventListener("abort", onToolAbort);
+      }
+    },
+  });
+
   return async (args: string, context: ExtensionContext) => {
     const match = args.trim().match(/^(\S+)(?:\s+([\s\S]*))?$/);
     const action = match?.[1] || "status";
@@ -379,4 +471,148 @@ function formatResult(action: string, result: any, echo: boolean) {
   if (!binding.enabled) return `已解绑并永久退出接力：${binding.title}`;
   const bound = `已绑定：${binding.title}\n话题：${binding.threadId}`;
   return action === "status" ? `${bound}\n输入镜像：${echo ? "开启" : "关闭"}` : bound;
+}
+
+type ChannelResult = { source: "feishu" | "tui"; results: AskResult[]; timedOut?: boolean };
+
+/**
+ * 宿主提供的同名内置工具委托入口。omp 在扩展工具 ctx 上暴露 invokeTool（指向被遮蔽的内置 ask），
+ * pi 的旧版本类型里没有这个方法，因此按运行时形状探测：拿不到就退回本扩展的对话框实现。
+ */
+function nativeAskInvoker(context: ExtensionContext) {
+  const candidate = (context as { invokeTool?: unknown }).invokeTool;
+  if (typeof candidate !== "function") return undefined;
+  // 调用签名由宿主保证（同名内置工具、参数已被 schema 校验），这里只补类型声明。
+  return candidate as (
+    params: unknown,
+    options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback },
+  ) => Promise<AgentToolResult<Record<string, unknown>>>;
+}
+
+/** 取消与原生一致：中止当前操作并抛错，让上层看到的是「被用户取消」。 */
+function askCancelled(context: ExtensionContext): never {
+  context.abort();
+  throw new Error("原始 ask 已被用户取消（Ask tool was cancelled by the user）。");
+}
+
+/** 校验网关回来的答案：跨进程边界只认结构，题目按 id 对齐，缺失按空答案处理。 */
+function readAskAnswers(response: unknown, questions: AskQuestion[]): AskResult[] | undefined {
+  const answers = asRecord(asRecord(response)?.answers);
+  if (!answers) return undefined;
+  return questions.map((question) => {
+    const entry = asRecord(answers[question.id]);
+    const selected = entry?.selectedOptions;
+    return {
+      question,
+      answer: {
+        selectedOptions: Array.isArray(selected) ? selected.filter((label): label is string => typeof label === "string") : [],
+        customInput: typeof entry?.customInput === "string" ? entry.customInput : undefined,
+        note: typeof entry?.note === "string" ? entry.note : undefined,
+        timedOut: entry?.timedOut === true ? true : undefined,
+      },
+    };
+  });
+}
+
+/** 双通道竞速：先给出结果的一侧胜出；一侧失败不影响另一侧继续等待。 */
+function raceFirst(candidates: Array<Promise<ChannelResult | undefined>>): Promise<ChannelResult | undefined> {
+  return new Promise((resolve) => {
+    let remaining = candidates.length;
+    for (const candidate of candidates) {
+      void candidate.then((value) => {
+        if (value !== undefined) resolve(value);
+        else if (--remaining === 0) resolve(undefined);
+      });
+    }
+  });
+}
+
+/** 终端通道的超时兜底：到点按推荐项作答（与原生 ask 的超时语义一致）并收起已打开的对话框。 */
+function withAskTimeout(
+  channel: Promise<ChannelResult | undefined>,
+  timeoutMs: number,
+  questions: AskQuestion[],
+  onTimeout: () => void,
+): Promise<ChannelResult | undefined> {
+  if (timeoutMs <= 0) return channel;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      onTimeout();
+      resolve({
+        source: "tui",
+        timedOut: true,
+        results: questions.map((question) => ({ question, answer: resolveTimeoutAnswer(question, undefined) })),
+      });
+    }, timeoutMs);
+    timer.unref?.();
+    void channel.then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    });
+  });
+}
+
+/** 终端侧对话框：复刻原生 ask 的选择器回退（单选 + Other、多选勾选循环）。 */
+async function runTuiChannel(context: ExtensionContext, questions: AskQuestion[], signal: AbortSignal): Promise<ChannelResult | undefined> {
+  const results: AskResult[] = [];
+  for (const question of questions) {
+    if (signal.aborted) return undefined;
+    const answer = await askOnce(context, question, signal);
+    if (!answer) return undefined;
+    results.push({ question, answer });
+  }
+  return { source: "tui", results };
+}
+
+async function askOnce(context: ExtensionContext, question: AskQuestion, signal: AbortSignal): Promise<AskAnswer | undefined> {
+  const title = `${question.header ? `【${question.header}】` : ""}${question.question}`;
+  const dialog = { signal };
+  if (!question.options.length) {
+    const text = await context.ui.input(title, "输入答案 / type your answer", dialog);
+    return text === undefined ? undefined : { selectedOptions: [], customInput: text };
+  }
+  const otherLabel = "Other (type your own)";
+  const labels = question.options.map((option, index) => `${option.label}${question.recommended === index ? " (Recommended)" : ""}`);
+  if (!question.multi) {
+    const picked = await context.ui.select(title, [...labels, otherLabel], dialog);
+    if (picked === undefined) return undefined;
+    if (picked !== otherLabel) {
+      const index = labels.indexOf(picked);
+      return { selectedOptions: [question.options[index >= 0 ? index : 0].label] };
+    }
+    const text = await context.ui.input(title, "输入答案 / type your answer", dialog);
+    return text === undefined ? undefined : { selectedOptions: [], customInput: text };
+  }
+  // 多选：勾选循环，至少选一项后才出现完成项，与原生回退一致。
+  const selected: string[] = [];
+  for (;;) {
+    const entries = labels.map((label, index) => `${selected.includes(question.options[index].label) ? "✅ " : ""}${label}`);
+    const doneLabel = "Done selecting";
+    const picked = await context.ui.select(title, selected.length ? [...entries, doneLabel, otherLabel] : [...entries, otherLabel], dialog);
+    if (picked === undefined) return undefined;
+    if (picked === doneLabel) return { selectedOptions: [...selected] };
+    if (picked === otherLabel) {
+      const text = await context.ui.input(title, "输入答案 / type your answer", dialog);
+      return text === undefined ? undefined : { selectedOptions: [...selected], customInput: text };
+    }
+    const index = entries.indexOf(picked);
+    if (index < 0) continue;
+    const label = question.options[index].label;
+    const at = selected.indexOf(label);
+    if (at >= 0) selected.splice(at, 1);
+    else selected.push(label);
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+/** ask 结果的统一外形：text 给模型看，details 给 TUI 渲染，与原生 ask 的返回结构对齐。 */
+function askToolResult(results: AskResult[]) {
+  return {
+    content: [{ type: "text" as const, text: formatAskText(results) }],
+    details: formatAskDetails(results),
+  };
 }

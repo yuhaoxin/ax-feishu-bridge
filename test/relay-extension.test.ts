@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { RelayGateway } from "../src/adapters/pi/relay-gateway.ts";
 import { registerRelayExtension, relayTitle } from "../src/adapters/pi/relay-extension.ts";
+import { ASK_ACTION } from "../src/feishu/ask-card.ts";
 import type { RelayTransport } from "../src/adapters/pi/relay-output.ts";
 
 async function waitFor(check: () => boolean) {
@@ -26,6 +27,15 @@ async function fixture(t: any) {
   const journal: string[] = [];
   // 扩展主动发到话题的内容（输入镜像、正式回复、无答案说明）；不含网关自己的投递状态回执
   const outbound = () => journal.filter((entry) => entry.startsWith("card:") || entry.startsWith("text:🖥 输入：") || entry.startsWith("text:本轮没有正式回复"));
+  const cardUpdates: Array<{ messageId: string; card: any }> = [];
+  /** 终端侧对话框：测试用 resolve 模拟用户选择，signal 中止即视为取消。 */
+  const dialogs: Array<{ kind: "select" | "input"; title: string; options: string[]; aborted: boolean; resolve: (value: string | undefined) => void }> = [];
+  const openDialog = (kind: "select" | "input", title: string, options: string[], signal?: AbortSignal) =>
+    new Promise<string | undefined>((resolve) => {
+      const entry = { kind, title, options, aborted: false, resolve };
+      dialogs.push(entry);
+      signal?.addEventListener("abort", () => { entry.aborted = true; resolve(undefined); }, { once: true });
+    });
   const renames: Array<{ root: string; title: string }> = [];
   const status = new Map<string, string>();
   let busy = false;
@@ -40,6 +50,7 @@ async function fixture(t: any) {
     async createRelayTopic() { topic++; return { threadId: `omt_${topic}`, rootMessageId: `om_${topic}` }; },
     async replyRelayText(_root, text) { attempts++; if (sendFailure) throw new Error(sendFailure); notices.push(text); journal.push(`text:${text}`); },
     async replyRelayCard(root, card) { attempts++; if (sendFailure) throw new Error(sendFailure); cards.push({ root, card }); journal.push(`card:${card.elements[0].content}`); return `card_${cards.length}`; },
+    async updateRelayCard(messageId, card) { cardUpdates.push({ messageId, card }); },
     async renameRelayTitle(root, title) { renames.push({ root, title }); },
   };
   const gateway = new RelayGateway(join(dir, "state.json"), join(dir, "endpoint.json"), "app", transport);
@@ -62,7 +73,12 @@ async function fixture(t: any) {
     cwd,
     sessionManager: { getSessionId: () => id, getSessionFile: () => "/not-read/session.jsonl", getSessionName: () => sessionName },
     isIdle: () => !busy,
-    ui: { notify: (text: string) => notices.push(text), setStatus: (key: string, text: string) => status.set(key, text) },
+    ui: {
+      notify: (text: string) => notices.push(text),
+      setStatus: (key: string, text: string) => status.set(key, text),
+      select: (title: string, options: string[], opts?: { signal?: AbortSignal }) => openDialog("select", title, options, opts?.signal),
+      input: (title: string, _placeholder?: string, opts?: { signal?: AbortSignal }) => openDialog("input", title, [], opts?.signal),
+    },
   };
   const command = registerRelayExtension(pi, join(dir, "endpoint.json"));
   const emit = (event: string, value = {}) => handlers.get(event)?.(value, ctx);
@@ -74,7 +90,8 @@ async function fixture(t: any) {
     chatId: "oc_test", chatType: "group", threadId, messageId, senderOpenId: "ou_owner", msgType: "text", content: JSON.stringify({ text: "来自飞书" }),
   });
   return {
-    emit, emitAsync, ctx, command, inputs, cards, renames, notices, incoming, handlers, tools, status, journal, outbound,
+    emit, emitAsync, ctx, command, inputs, cards, cardUpdates, dialogs, gateway, renames, notices, incoming, handlers, tools, status, journal, outbound,
+    answerDialog: (value: string) => dialogs.filter((dialog) => !dialog.aborted).pop()?.resolve(value),
     attempts: () => attempts,
     setSendFailure: (value: string | undefined) => { sendFailure = value; },
     topicCount: () => topic,
@@ -408,4 +425,57 @@ test("接力扩展：技能与模板仍按输入原文处理", async (t) => {
   await waitFor(() => f.topicCount() === 1);
   await waitFor(() => f.outbound().length === 1);
   assert.deepEqual(f.outbound(), ["text:🖥 输入：/skill:demo 用法"], "技能输入镜像原文");
+});
+
+/** 从 ask 卡片的按钮里取回复用 runId：它由扩展每次提问随机生成。 */
+function cardRunId(card: any): string {
+  for (const element of card.elements) {
+    for (const action of element.actions || []) {
+      if (action?.value?.action === ASK_ACTION) return action.value.runId;
+    }
+  }
+  assert.fail("卡片里没有 ask 按钮");
+}
+
+test("接力 ask：终端作答胜出并作废飞书卡片", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "首条输入", source: "interactive" });
+  await waitFor(() => f.topicCount() === 1);
+  const ask = f.tools.find((tool) => tool.name === "ask");
+  assert.ok(ask, "扩展要注册 ask 工具遮蔽内置实现");
+  const run = ask.execute("call-1", { questions: [{ id: "q1", question: "选哪个？", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, f.ctx);
+  await waitFor(() => f.cards.length === 1 && f.dialogs.length === 1);
+  f.answerDialog("B");
+  const result = await run;
+  assert.match(result.content[0].text, /B/, "终端选择要回到工具结果里");
+  assert.equal(result.details.selectedOptions[0], "B");
+  await waitFor(() => f.cardUpdates.length === 1);
+  assert.match(JSON.stringify(f.cardUpdates[0].card), /已在终端回答/, "终端先答后飞书卡片要作废");
+});
+
+test("接力 ask：飞书作答胜出并收起终端对话框", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "首条输入", source: "interactive" });
+  await waitFor(() => f.topicCount() === 1);
+  const ask = f.tools.find((tool) => tool.name === "ask");
+  const run = ask.execute("call-2", { questions: [{ id: "q1", question: "选哪个？", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, f.ctx);
+  await waitFor(() => f.cards.length === 1 && f.dialogs.length === 1);
+  await f.gateway.handleAskAction({
+    messageId: "card_1", chatId: "oc_test", operatorOpenId: "ou_owner",
+    value: { action: ASK_ACTION, runId: cardRunId(f.cards[0].card), questionId: "q1", kind: "option", label: "A" },
+  });
+  const result = await run;
+  assert.match(result.content[0].text, /A/, "飞书选择要回到工具结果里");
+  await waitFor(() => f.dialogs[0].aborted);
+});
+
+test("接力 ask：未绑定时只走终端对话框，不发飞书卡片", async (t) => {
+  const f = await fixture(t);
+  const ask = f.tools.find((tool) => tool.name === "ask");
+  const run = ask.execute("call-3", { questions: [{ id: "q1", question: "选哪个？", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, f.ctx);
+  await waitFor(() => f.dialogs.length === 1);
+  f.answerDialog("A");
+  const result = await run;
+  assert.match(result.content[0].text, /A/);
+  assert.equal(f.cards.length, 0, "未绑定不能发飞书卡片");
 });

@@ -187,7 +187,7 @@ export default function createPiFeishuExtension(
       updateStatus(loadConfig() ? "owned" : "not configured");
       if (process.env.PI_FEISHU_DAEMON === "1") process.exit(0);
     });
-    transport = new FeishuTransport(cfg, (msg) => messageHandler.handle(msg), createCardActionHandler(conversations, () => transport), async (msg) => {
+    transport = new FeishuTransport(cfg, (msg) => messageHandler.handle(msg), createCardActionHandler(conversations, () => transport, (action) => relay ? relay.handleAskAction(action) : Promise.resolve(undefined)), async (msg) => {
       if (!relay) throw new Error("接力网关尚未就绪，拒绝分派消息。");
       return relay.handleMessage(msg);
     });

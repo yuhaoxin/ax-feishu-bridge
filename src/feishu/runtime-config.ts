@@ -15,6 +15,8 @@ export const RUNTIME_CONFIG_KEYS = [
   "streamPrintFrequencyMs",
   "streamPrintStep",
   "streamPushIntervalMs",
+  "askTimeoutSec",
+  "askNotifySec",
 ] as const;
 
 export type RuntimeConfigKey = (typeof RUNTIME_CONFIG_KEYS)[number];
@@ -31,6 +33,8 @@ export type RuntimeConfigView = {
   streamPrintFrequencyMs?: number;
   streamPrintStep?: number;
   streamPushIntervalMs?: number;
+  askTimeoutSec?: number;
+  askNotifySec?: number;
   [key: string]: unknown;
 };
 
@@ -95,6 +99,14 @@ export function parseRuntimeConfigValue(key: string, raw: string): ParseResult {
       const n = Number.parseInt(text, 10);
       if (!Number.isFinite(n) || n <= 0) {
         return { ok: false, error: `${key} 必须是正整数` };
+      }
+      return { ok: true, value: n };
+    }
+    case "askTimeoutSec":
+    case "askNotifySec": {
+      const n = Number.parseInt(text, 10);
+      if (!Number.isFinite(n) || n < 0) {
+        return { ok: false, error: `${key} 必须是非负整数秒（0 表示关闭）` };
       }
       return { ok: true, value: n };
     }
@@ -221,6 +233,8 @@ export function formatRuntimeConfig(cfg: RuntimeConfigView, overrides?: RuntimeO
     `streamPrintFrequencyMs: ${cfg.streamPrintFrequencyMs ?? ""}${mark("streamPrintFrequencyMs")}`,
     `streamPrintStep: ${cfg.streamPrintStep ?? ""}${mark("streamPrintStep")}`,
     `streamPushIntervalMs: ${cfg.streamPushIntervalMs ?? ""}${mark("streamPushIntervalMs")}`,
+    `askTimeoutSec: ${cfg.askTimeoutSec ?? ""}${mark("askTimeoutSec")}`,
+    `askNotifySec: ${cfg.askNotifySec ?? ""}${mark("askNotifySec")}`,
     "",
     "修改: /config <key> <value>",
     "清除: /config clear <key|all>",

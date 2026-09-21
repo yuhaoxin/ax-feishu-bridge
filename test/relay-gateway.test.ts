@@ -23,6 +23,7 @@ export function fakeTransport() {
     },
     async replyRelayText(root, value) { text.push({ root, text: value }); },
     async replyRelayCard(root, card) { cards.push({ root, card }); return `om_card${cards.length}`; },
+    async updateRelayCard() {},
     async renameRelayTitle(root, title) { renames.push({ root, title }); },
   };
   return { topics, renames, text, cards, transport };

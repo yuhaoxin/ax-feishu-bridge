@@ -432,6 +432,11 @@ export class FeishuTransport {
     return String(data.message_id);
   }
 
+  async updateRelayCard(messageId: string, card: object) {
+    debugLog("feishu.relay.card.update", { messageId });
+    await this.updateCard(messageId, card);
+  }
+
   private relayResult(result: any) {
     // POST 请求失败时不自动重放；HTTP 成功也可能包含飞书业务错误码。
     if (result?.code !== 0 || !result?.data) throw new Error(`飞书接力请求未确认成功（错误码 ${result?.code ?? "未知"}），请检查飞书后再操作。`);
