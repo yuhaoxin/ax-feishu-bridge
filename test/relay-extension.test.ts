@@ -218,6 +218,23 @@ test("接力扩展：每条正式答案都推送，整轮没有答案时说明�
   assert.match(f.journal[3], /^text:本轮没有正式回复/);
 });
 
+test("接力扩展：omp 自动续跑的 agent_end 不清账、也不提示没有回复", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "开始", source: "interactive" });
+  await waitFor(() => f.journal.length === 1);
+  await f.emit("agent_start");
+  await f.emit("message_end", assistant("先看看文件", "stop", [{ type: "toolCall", id: "t1", name: "read", arguments: {} }]));
+  // 模型自动重试/续跑：omp 的 agent_end 带 willContinue，表示这不是用户可见的终态
+  await f.emit("agent_end", { willContinue: true });
+  await f.emit("agent_end", { willContinue: true });
+  assert.deepEqual(f.journal.slice(1), [], "续跑期间不得推送「没有正式回复」");
+  // 续跑产生的正式答案仍要推送：turnId 没有被续跑的 agent_end 清掉
+  await f.emit("message_end", assistant("续跑后的答案"));
+  await f.emit("agent_end");
+  await waitFor(() => f.journal.length === 2);
+  assert.deepEqual(f.journal.slice(1), ["card:续跑后的答案"], "续跑里的正式答案不能漏发");
+});
+
 test("接力扩展：关闭输入镜像只停镜像，话题与正式回复照常", async (t) => {
   const f = await fixture(t);
   await f.emitAsync("input", { text: "首条", source: "interactive" });

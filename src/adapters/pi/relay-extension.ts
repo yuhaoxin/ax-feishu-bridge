@@ -292,7 +292,11 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     const id = `${turnId}.${++replies}`;
     enqueue((active) => active.output({ id, text }));
   });
-  pi.on("agent_end", () => {
+  pi.on("agent_end", (event) => {
+    // omp 在自动续跑（自动重试、空回复重试等）时也会发 agent_end，并用 willContinue 说明这不是
+    // 用户可见的终态。这里若照常清账，续跑里的正式答案会因为 turnId 已清空而漏发，话题里还会多出
+    // 一条「没有正式回复」的噪声提示。
+    if ((event as { willContinue?: boolean } | undefined)?.willContinue) return;
     const active = client;
     // 整轮没有任何正式答案（中止、出错、只跑工具）时说明一声，避免飞书侧以为卡住。
     if (turnId && !answered && active?.binding?.enabled) {
