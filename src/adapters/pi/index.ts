@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -183,10 +185,7 @@ export default function createPiFeishuExtension(
       transport = undefined;
       gatewayLock = undefined;
       updateStatus(loadConfig() ? "owned" : "not configured");
-      if (process.env.PI_FEISHU_DAEMON === "1") {
-        terminateLauncherParent();
-        process.exit(0);
-      }
+      if (process.env.PI_FEISHU_DAEMON === "1") process.exit(0);
     });
     transport = new FeishuTransport(cfg, (msg) => messageHandler.handle(msg), createCardActionHandler(conversations, () => transport), async (msg) => {
       if (!relay) throw new Error("接力网关尚未就绪，拒绝分派消息。");
@@ -235,10 +234,6 @@ export default function createPiFeishuExtension(
     ctx.ui.notify(withBuildTag(`飞书连接已启动。\nGateway pid=${result.pid}\nLog: ${getRuntimeSource().daemonLogPath}`), "info");
   }
 
-  function quoteShell(value: string) {
-    return `'${value.replace(/'/g, `'\\''`)}'`;
-  }
-
   function daemonSpec() {
     // omp runtime 下 daemon 用 omp 拉起；omp 不识别 pi 的
     // --no-prompt-templates/--no-themes/--no-context-files/--no-builtin-tools，
@@ -268,7 +263,7 @@ export default function createPiFeishuExtension(
 
   function daemonCommand() {
     const { piBin, args } = daemonSpec();
-    return `tail -f /dev/null | exec ${quoteShell(piBin)} ${args.map(quoteShell).join(" ")}`;
+    return daemonShellCommand(piBin, args);
   }
 
   async function startDaemon(takeover = false) {
@@ -314,7 +309,7 @@ export default function createPiFeishuExtension(
           env: { ...process.env, PI_FEISHU_DAEMON: "1" },
           stdio: ["pipe", logFd, logFd],
         });
-        // 保持 stdin 打开，等价于 Linux 侧 `tail -f /dev/null |` 的作用，
+        // 保持 stdin 打开，等价于 POSIX 侧一次性 FIFO 的作用，
         // 否则 pi --mode rpc 会在 stdin EOF 后退出。
         if (child.stdin) (child.stdin as unknown as Readable).resume();
       } else {
@@ -625,20 +620,28 @@ function looksLikeFeishuDaemon(command: string, extensionPath?: string) {
   return command.includes("feishu/index.ts");
 }
 
-function terminateLauncherParent() {
-  if (process.platform === "win32") return;
-  const parentPid = process.ppid;
-  if (!parentPid || parentPid <= 1) return;
+/** 把值包成 shell 单引号字面量：命令里的路径与参数都可能含空格或引号。 */
+export function quoteShell(value: string) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
 
-  const result = spawnSync("ps", ["-wwaxo", "pid=,command="], { encoding: "utf8" });
-  if (result.status !== 0) return;
-
-  const line = result.stdout.split("\n")
-    .map((entry) => entry.trim())
-    .find((entry) => entry.startsWith(`${parentPid} `));
-  if (!line) return;
-  if (!line.includes("tail -f /dev/null") || !line.includes("feishu/index.ts")) return;
-  try { process.kill(parentPid, "SIGTERM"); } catch {}
+/**
+ * daemon 启动命令。
+ *
+ * stdin 必须永不 EOF：omp/pi 的 rpc 模式读到 stdin EOF 就退出，所以不能直接用 /dev/null。
+ * 这里改用一次性 FIFO 并以读写方式打开（fd 3 同时持有读写两端），因此不再需要
+ * `tail -f /dev/null` 这类常驻进程：daemon 退出后没有可被遗弃的管道另一端，
+ * FIFO 也在打开后立即 unlink，不在磁盘上留文件。
+ */
+export function daemonShellCommand(piBin: string, args: string[], fifoDir = tmpdir()) {
+  // 名字里带本进程 pid：同一台机器上并发拉起 daemon 的插件进程各用各的 FIFO。
+  const fifo = join(fifoDir, `ax-feishu-bridge-daemon-${process.pid}.fifo`);
+  const daemon = `exec ${quoteShell(piBin)} ${args.map(quoteShell).join(" ")} <&3`;
+  return [
+    `fifo=${quoteShell(fifo)}`,
+    `rm -f "$fifo"`,
+    `mkfifo "$fifo" && exec 3<>"$fifo" && rm -f "$fifo" && ${daemon} || { echo "[feishu] daemon stdin FIFO 不可用：$fifo" >&2; exit 1; }`,
+  ].join("; ");
 }
 
 async function withDaemonSpawnLock<T>(fn: () => Promise<T>): Promise<T> {
