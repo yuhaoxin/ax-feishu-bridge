@@ -389,6 +389,11 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
       signal?.addEventListener("abort", onToolAbort, { once: true });
       try {
         const active = client;
+        // 网关 35 秒无流量会关掉连接，心跳每 10 秒补一次：恰好落在重连窗口里的提问会被
+        // 瞬时断链静默降级成只用终端对话框。这里先补一次连接再判定绑定。
+        if (active && !active.connected) {
+          try { await active.connect(); } catch {}
+        }
         const bound =
           active?.connected === true &&
           active.binding?.enabled === true &&
@@ -407,7 +412,11 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
             const results = readAskAnswers(response, questions);
             return results ? { source: "feishu" as const, results, timedOut: results.some((item) => item.answer.timedOut === true) } : undefined;
           })
-          .catch(() => undefined);
+          // 飞书通道失败不能静默：否则用户只看到终端对话框，不知道话题里为什么没有卡片。
+          .catch((error) => {
+            ctx?.ui.notify(askChannelNotice(error), "warning");
+            return undefined;
+          });
         const tui = withAskTimeout(runTuiChannel(context, questions, controller.signal), timeoutMs, questions, () => controller.abort());
         const winner = await raceFirst([feishu, tui]);
         if (winner?.source === "feishu") controller.abort();
@@ -607,6 +616,12 @@ async function askOnce(context: ExtensionContext, question: AskQuestion, signal:
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
+}
+
+/** 飞书通道失败时的终端提示：保留网关返回的原因，便于区分未绑定、离线与飞书接口报错。 */
+function askChannelNotice(error: unknown) {
+  const reason = error instanceof Error ? error.message : String(error);
+  return `提问未送到飞书：${reason} 本轮仅在终端作答。`;
 }
 
 /** ask 结果的统一外形：text 给模型看，details 给 TUI 渲染，与原生 ask 的返回结构对齐。 */

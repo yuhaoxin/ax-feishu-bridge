@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import { createServer, type Server } from "node:net";
 import { dirname } from "node:path";
 import { loadConfig } from "../../feishu/config.ts";
+import { debugLog } from "../../feishu/debug.ts";
 import {
   buildAskCard,
   emptyAnswer,
@@ -333,6 +334,7 @@ export class RelayGateway {
     if (this.pendingAsks.has(runId)) throw new Error("同一个提问 ID 已存在，拒绝重复发卡。");
     const questions = parseAskQuestions(raw?.questions);
     const limits = this.askLimits();
+    debugLog("feishu.relay.ask.received", { sessionId, runId, questions: questions.length });
     const pending: PendingAsk = {
       runId,
       sessionId,
@@ -351,8 +353,10 @@ export class RelayGateway {
     this.pendingAsks.set(runId, pending);
     try {
       pending.cardMessageId = await this.transport.replyRelayCard(binding.rootMessageId, buildAskCard(this.askCardState(pending, "pending")));
+      debugLog("feishu.relay.ask.card_sent", { runId, cardMessageId: pending.cardMessageId });
     } catch (error) {
       // 发卡失败必须清掉等待项，否则同名 runId 会一直占位，且终端侧无法回退到对话框。
+      debugLog("feishu.relay.ask.send_failed", { runId, error: error instanceof Error ? error.message : String(error) });
       this.pendingAsks.delete(runId);
       throw error;
     }
@@ -363,8 +367,12 @@ export class RelayGateway {
   /** 终端侧已作答（或已取消）时收回飞书卡片，避免继续等一个不会来的回答。 */
   private async handleAskCancel(sessionId: string, params: unknown): Promise<{ ok: boolean }> {
     const raw = asParams(params);
-    const ask = this.pendingAsks.get(requireString(raw?.runId, 200));
-    if (!ask || ask.sessionId !== sessionId) return { ok: false };
+    const runId = requireString(raw?.runId, 200);
+    const ask = this.pendingAsks.get(runId);
+    if (!ask || ask.sessionId !== sessionId) {
+      debugLog("feishu.relay.ask.cancel_missed", { sessionId, runId });
+      return { ok: false };
+    }
     this.settleAsk(ask, raw?.timeout === true ? "timeout" : "terminal");
     return { ok: true };
   }
@@ -380,9 +388,13 @@ export class RelayGateway {
     if (action.operatorOpenId !== this.state.settings?.ownerOpenId) return undefined;
     if (action.chatId && action.chatId !== this.state.settings?.chatId) return undefined;
     const ask = this.pendingAsks.get(parsed.runId);
-    if (!ask || ask.done) return buildAskCard({ runId: parsed.runId, questions: [], answers: new Map<string, AskAnswer>(), status: "expired" });
+    if (!ask || ask.done) {
+      debugLog("feishu.relay.ask.action_stale", { runId: parsed.runId, questionId: parsed.questionId, kind: parsed.kind });
+      return buildAskCard({ runId: parsed.runId, questions: [], answers: new Map<string, AskAnswer>(), status: "expired" });
+    }
     const question = ask.questions.find((item) => item.id === parsed.questionId);
     if (!question) return buildAskCard(this.askCardState(ask, "pending"));
+    debugLog("feishu.relay.ask.action", { runId: parsed.runId, questionId: parsed.questionId, kind: parsed.kind });
     this.applyAskAction(ask, question, parsed);
     if (ask.questions.every((item) => this.askQuestionDone(ask, item))) {
       this.settleAsk(ask, "done");
