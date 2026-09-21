@@ -151,7 +151,7 @@ export class PiConversationRuntime implements ConversationRuntime {
         deltaCount,
         deltaChars,
       });
-      await onReply(answer || "No response.");
+      await onReply(answer || describeEmptyAnswer(session));
       // onReply（ReplyCard.completeWithAnswer）已切到 done；此处仅兜底
       await status?.finish("done");
     }).catch(async (error) => {
@@ -840,20 +840,39 @@ function extractAssistantTextDelta(event: any): string | undefined {
   return undefined;
 }
 
-function extractLastAssistantText(session: AgentSession): string {
+/**
+ * 最后一条带可见文本的助手回复。
+ * 纯思考块或纯工具调用的助手消息不是回复，遇到时必须继续往前找，
+ * 否则整轮的回复文本会被最后一条中间消息挡掉，只剩空答案。
+ */
+export function extractLastAssistantText(session: AgentSession): string {
   const messages = [...(session.messages || [])].reverse();
   for (const msg of messages as any[]) {
     if (msg.role !== "assistant") continue;
     const content = msg.content;
-    if (typeof content === "string") return content.trim();
-    if (Array.isArray(content)) {
-      return content
-        .map((p) => p?.type === "text" ? p.text : "")
-        .join("")
-        .trim();
-    }
+    const text = typeof content === "string"
+      ? content.trim()
+      : Array.isArray(content)
+        ? content
+          .map((p) => p?.type === "text" ? p.text : "")
+          .join("")
+          .trim()
+        : "";
+    if (text) return text;
   }
   return "";
+}
+
+/**
+ * 整轮没有回复文本时的可见说明。
+ * 没有它，「模型没有返回内容」「请求报错」「已中止」在飞书侧看起来完全一样，无从定位。
+ */
+export function describeEmptyAnswer(session: AgentSession): string {
+  const last = [...(session.messages || [])].reverse().find((msg: any) => msg?.role === "assistant") as any;
+  const error = typeof last?.errorMessage === "string" ? last.errorMessage.trim() : "";
+  if (error) return `本轮没有生成回复文本。原因：${error}`;
+  if (last?.stopReason === "aborted") return "本轮已中止，没有生成回复文本。";
+  return "本轮没有生成回复文本（模型没有返回内容）。可以再发一次。";
 }
 
 /** 把 Pi 原生模型对象转换成平台无关的 RuntimeModel（禁止原生对象泄漏到飞书层）。 */
