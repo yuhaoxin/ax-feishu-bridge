@@ -15,7 +15,6 @@ export const RUNTIME_CONFIG_KEYS = [
   "streamPrintFrequencyMs",
   "streamPrintStep",
   "streamPushIntervalMs",
-  "askTimeoutSec",
   "askNotifySec",
 ] as const;
 
@@ -33,7 +32,6 @@ export type RuntimeConfigView = {
   streamPrintFrequencyMs?: number;
   streamPrintStep?: number;
   streamPushIntervalMs?: number;
-  askTimeoutSec?: number;
   askNotifySec?: number;
   [key: string]: unknown;
 };
@@ -102,7 +100,6 @@ export function parseRuntimeConfigValue(key: string, raw: string): ParseResult {
       }
       return { ok: true, value: n };
     }
-    case "askTimeoutSec":
     case "askNotifySec": {
       const n = Number.parseInt(text, 10);
       if (!Number.isFinite(n) || n < 0) {
@@ -233,7 +230,6 @@ export function formatRuntimeConfig(cfg: RuntimeConfigView, overrides?: RuntimeO
     `streamPrintFrequencyMs: ${cfg.streamPrintFrequencyMs ?? ""}${mark("streamPrintFrequencyMs")}`,
     `streamPrintStep: ${cfg.streamPrintStep ?? ""}${mark("streamPrintStep")}`,
     `streamPushIntervalMs: ${cfg.streamPushIntervalMs ?? ""}${mark("streamPushIntervalMs")}`,
-    `askTimeoutSec: ${cfg.askTimeoutSec ?? ""}${mark("askTimeoutSec")}`,
     `askNotifySec: ${cfg.askNotifySec ?? ""}${mark("askNotifySec")}`,
     "",
     "修改: /config <key> <value>",

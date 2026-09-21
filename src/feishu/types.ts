@@ -31,12 +31,9 @@ export type FeishuConfig = {
   /** Hard prompt timeout in seconds (0 waits indefinitely). */
   promptTimeoutSec?: number;
   /**
-   * 接力 ask 提问在飞书侧的等待上限（秒），0 = 永久等待（默认）。
-   * 终端 ask 的 ask.timeout 设置扩展侧读不到，飞书侧超时统一用这个值；
-   * 到期后未作答的问题按推荐项自动作答，与原生 ask 的超时语义一致。
+   * 接力 ask 提问的催单阈值（秒），0 = 不催单（默认）：到点后在话题里提醒一次。
+   * 提问本身没有等待上限，只有终端连接断开或用户作答才结束。
    */
-  askTimeoutSec?: number;
-  /** 接力 ask 提问的催单阈值（秒），0 = 不催单（默认）；到点后在话题里提醒一次。 */
   askNotifySec?: number;
   /** 解析入站 interactive 卡片（默认 true） */
   parseInteractiveCards?: boolean;

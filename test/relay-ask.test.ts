@@ -38,11 +38,11 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3000) {
   }
 }
 
-async function fixture(t: { after: (fn: () => Promise<void> | void) => void }, bind = true, limits?: () => { timeoutMs: number; notifyMs: number }) {
+async function fixture(t: { after: (fn: () => Promise<void> | void) => void }, bind = true, askNotifyMs?: () => number) {
   const dir = mkdtempSync(join(tmpdir(), "pi-ask-test-"));
   const endpoint = join(dir, "endpoint.json");
   const fake = fakeTransport();
-  const gateway = new RelayGateway(join(dir, "state.json"), endpoint, "app_test", fake.transport, undefined, limits);
+  const gateway = new RelayGateway(join(dir, "state.json"), endpoint, "app_test", fake.transport, undefined, askNotifyMs);
   await gateway.start();
   const inputs: Array<{ method: string; params: unknown }> = [];
   const client = new RelayClient(endpoint, "session-a", async (method, params) => {
@@ -72,7 +72,6 @@ test("接力 ask：单选按钮点按即作答并回灌终端", async (t) => {
   assert.ok(answerFor(updated, "已选：B"), `回调要返回标记已答的卡片，实际：${JSON.stringify(updated)}`);
   const answers = await ask;
   assert.deepEqual(answers.answers.q1.selectedOptions, ["B"]);
-  assert.equal(answers.answers.q1.timedOut, undefined);
 });
 
 test("接力 ask：多选题必须点提交才算答完", async (t) => {
@@ -142,17 +141,22 @@ test("接力 ask：终端断线结束提问并作废卡片", async (t) => {
   assert.match(error!.message, /接力连接中断/);
 });
 
-test("接力 ask：超时按推荐项自动作答并先催单", async (t) => {
-  const f = await fixture(t, true, () => ({ timeoutMs: 120, notifyMs: 40 }));
+test("接力 ask：等待期间只催单，不会替用户作答", async (t) => {
+  const f = await fixture(t, true, () => 40);
   const ask = f.client.request("ask", {
     runId: "r6",
     questions: [{ id: "q1", question: "选哪个？", options: [{ label: "A" }, { label: "B" }], recommended: 1 }],
   }, 8000);
+  await waitFor(() => f.text.some((entry) => entry.text.includes("提问已等待")));
+  const settledEarly = await Promise.race([ask.then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 150))]);
+  assert.equal(settledEarly, false, "催单不能顺手把问题答了");
+  assert.equal(f.cardUpdates.length, 0, "催单不改卡片状态");
+  await f.gateway.handleAskAction({
+    messageId: "om_card1", chatId: "oc_test", operatorOpenId: "ou_owner",
+    value: { action: ASK_ACTION, runId: "r6", questionId: "q1", kind: "option", label: "A" },
+  });
   const answers = await ask;
-  assert.deepEqual(answers.answers.q1.selectedOptions, ["B"]);
-  assert.equal(answers.answers.q1.timedOut, true);
-  assert.ok(f.text.some((entry) => entry.text.includes("提问已等待")), "到期前要先在话题里催单");
-  assert.ok(f.cardUpdates.some((update) => answerFor(update.card, "超时自动作答")), "超时后要刷新卡片");
+  assert.deepEqual(answers.answers.q1.selectedOptions, ["A"]);
 });
 
 test("ask 结果文本与 details 对齐原生结构", () => {
@@ -168,10 +172,10 @@ test("ask 结果文本与 details 对齐原生结构", () => {
   assert.ok(multi.startsWith("User answers:"), multi);
   assert.ok(multi.includes("q2: 随便"), multi);
   const multiDetails = formatAskDetails([
-    { question, answer: { selectedOptions: ["A"], timedOut: true } },
+    { question, answer: { selectedOptions: ["A"] } },
     { question: { id: "q2", question: "第二个", options: [] }, answer: { selectedOptions: [], customInput: "随便" } },
   ]);
   assert.equal(Array.isArray(multiDetails.results), true);
-  assert.equal(multiDetails.results[0].timedOut, true);
+  assert.deepEqual(multiDetails.results[0].selectedOptions, ["A"]);
   assert.equal(multiDetails.results[1].customInput, "随便");
 });

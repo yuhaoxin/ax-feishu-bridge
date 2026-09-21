@@ -10,7 +10,6 @@ import {
   isAnswered,
   parseAskActionValue,
   parseAskQuestions,
-  resolveTimeoutAnswer,
   type AskActionValue,
   type AskAnswer,
   type AskCardStatus,
@@ -46,12 +45,10 @@ type PendingAsk = {
   /** 多选题必须点「提交」才算答完，其余题型累计到答案即算。 */
   submitted: Set<string>;
   done: boolean;
-  timeoutMs: number;
   notifyMs: number;
   cardMessageId?: string;
   awaiting?: { questionId: string; kind: "other" | "note" };
   notifyTimer?: NodeJS.Timeout;
-  hardTimer?: NodeJS.Timeout;
   resolve: (value: { answers?: Record<string, AskAnswer> }) => void;
 };
 
@@ -78,8 +75,8 @@ export class RelayGateway {
     appId: string,
     private readonly transport: RelayTransport,
     private readonly isBackendSession: (sessionId: string) => Promise<boolean> = async () => false,
-    /** ask 等待上限与催单阈值（毫秒），缺省读取飞书配置；注入点让测试不必依赖进程级配置。 */
-    private readonly askLimits: () => { timeoutMs: number; notifyMs: number } = relayAskLimits,
+    /** 催单阈值（毫秒，0 表示不催单），缺省读取飞书配置；注入点让测试不必依赖进程级配置。 */
+    private readonly askNotifyMs: () => number = relayAskNotifyMs,
   ) {
     const parsed: any = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { version: 2, appId, bindings: [], receipts: {}, optOut: [] };
     this.state = parsed;
@@ -333,7 +330,7 @@ export class RelayGateway {
     if (!binding?.enabled) throw new Error("当前会话没有启用的绑定话题，提问未发到飞书。");
     if (this.pendingAsks.has(runId)) throw new Error("同一个提问 ID 已存在，拒绝重复发卡。");
     const questions = parseAskQuestions(raw?.questions);
-    const limits = this.askLimits();
+    const notifyMs = this.askNotifyMs();
     debugLog("feishu.relay.ask.received", { sessionId, runId, questions: questions.length });
     const pending: PendingAsk = {
       runId,
@@ -343,8 +340,7 @@ export class RelayGateway {
       answers: new Map<string, AskAnswer>(),
       submitted: new Set<string>(),
       done: false,
-      timeoutMs: limits.timeoutMs,
-      notifyMs: limits.notifyMs,
+      notifyMs,
       resolve: () => {},
     };
     const resolution = new Promise<{ answers?: Record<string, AskAnswer> }>((resolve) => {
@@ -360,7 +356,7 @@ export class RelayGateway {
       this.pendingAsks.delete(runId);
       throw error;
     }
-    this.armAskTimers(pending);
+    this.armAskNotify(pending);
     return resolution;
   }
 
@@ -373,7 +369,7 @@ export class RelayGateway {
       debugLog("feishu.relay.ask.cancel_missed", { sessionId, runId });
       return { ok: false };
     }
-    this.settleAsk(ask, raw?.timeout === true ? "timeout" : "terminal");
+    this.settleAsk(ask, "terminal");
     return { ok: true };
   }
 
@@ -430,22 +426,16 @@ export class RelayGateway {
     return isAnswered(ask.answers.get(question.id)) && (!question.multi || ask.submitted.has(question.id));
   }
 
-  private armAskTimers(ask: PendingAsk) {
-    if (ask.notifyMs > 0) {
-      ask.notifyTimer = setTimeout(() => {
-        void this.transport
-          .replyRelayText(ask.binding.rootMessageId, `⏳ 提问已等待 ${Math.round(ask.notifyMs / 1000)} 秒，请在上一条卡片里作答。`)
-          .catch(() => {});
-      }, ask.notifyMs);
-      ask.notifyTimer.unref?.();
-    }
-    if (ask.timeoutMs > 0) {
-      ask.hardTimer = setTimeout(() => {
-        for (const question of ask.questions) ask.answers.set(question.id, resolveTimeoutAnswer(question, ask.answers.get(question.id)));
-        this.settleAsk(ask, "timeout");
-      }, ask.timeoutMs);
-      ask.hardTimer.unref?.();
-    }
+  /** 催单：提问迟迟没人作答时在话题里提醒一次，绝不改变答案。 */
+  private armAskNotify(ask: PendingAsk) {
+    if (ask.notifyMs <= 0) return;
+    ask.notifyTimer = setTimeout(() => {
+      debugLog("feishu.relay.ask.notified", { runId: ask.runId, notifyMs: ask.notifyMs });
+      void this.transport
+        .replyRelayText(ask.binding.rootMessageId, `⏳ 提问已等待 ${Math.round(ask.notifyMs / 1000)} 秒，请在上一条卡片里作答。`)
+        .catch(() => {});
+    }, ask.notifyMs);
+    ask.notifyTimer.unref?.();
   }
 
   /** 结束一次提问：清计时器、刷新卡片、把答案交回终端。重复调用无副作用。 */
@@ -453,9 +443,7 @@ export class RelayGateway {
     if (ask.done) return;
     ask.done = true;
     if (ask.notifyTimer) clearTimeout(ask.notifyTimer);
-    if (ask.hardTimer) clearTimeout(ask.hardTimer);
     ask.notifyTimer = undefined;
-    ask.hardTimer = undefined;
     this.pendingAsks.delete(ask.runId);
     this.refreshAskCard(ask, status);
     ask.resolve({ answers: this.askAnswers(ask) });
@@ -474,7 +462,6 @@ export class RelayGateway {
       if (ask.sessionId !== sessionId) continue;
       ask.done = true;
       if (ask.notifyTimer) clearTimeout(ask.notifyTimer);
-      if (ask.hardTimer) clearTimeout(ask.hardTimer);
       this.pendingAsks.delete(ask.runId);
       this.refreshAskCard(ask, "expired");
       ask.resolve({});
@@ -497,13 +484,12 @@ export class RelayGateway {
   }
 }
 
-/** ask 的等待上限与催单阈值：飞书配置里 askTimeoutSec / askNotifySec 为秒，0 表示关闭。 */
-function relayAskLimits(): { timeoutMs: number; notifyMs: number } {
-  const config = loadConfig();
-  return {
-    timeoutMs: Math.max(0, config?.askTimeoutSec ?? 0) * 1000,
-    notifyMs: Math.max(0, config?.askNotifySec ?? 0) * 1000,
-  };
+/**
+ * 催单阈值：飞书配置里 askNotifySec 为秒，0 表示不催单。
+ * 提问没有等待上限：到期自动选一个答案会替用户做决定，实测不如一直等或直接由断线作废。
+ */
+function relayAskNotifyMs(): number {
+  return Math.max(0, loadConfig()?.askNotifySec ?? 0) * 1000;
 }
 
 /** 只做「是普通对象」这一层收窄；字段一律用现有校验函数逐个检查。 */

@@ -28,7 +28,6 @@ export type AskAnswer = {
   selectedOptions: string[];
   customInput?: string;
   note?: string;
-  timedOut?: boolean;
 };
 
 export type AskResult = {
@@ -36,7 +35,7 @@ export type AskResult = {
   answer: AskAnswer;
 };
 
-export type AskCardStatus = "pending" | "done" | "timeout" | "terminal" | "expired";
+export type AskCardStatus = "pending" | "done" | "terminal" | "expired";
 
 export type AskCardState = {
   runId: string;
@@ -114,18 +113,6 @@ export function emptyAnswer(): AskAnswer {
 export function isAnswered(answer: AskAnswer | undefined): boolean {
   if (!answer) return false;
   return answer.selectedOptions.length > 0 || (answer.customInput !== undefined && answer.customInput !== "");
-}
-
-/** 超时兜底：未答完的问题选推荐项，无推荐则第一个选项；与原生 ask 的超时语义一致。 */
-export function resolveTimeoutAnswer(question: AskQuestion, current: AskAnswer | undefined): AskAnswer {
-  if (isAnswered(current)) return current!;
-  const recommended = question.recommended !== undefined && question.options[question.recommended] ? question.recommended : undefined;
-  const fallback = recommended ?? (question.options.length ? 0 : undefined);
-  return {
-    ...current,
-    selectedOptions: current?.selectedOptions?.length ? current.selectedOptions : fallback === undefined ? [] : [question.options[fallback].label],
-    timedOut: true,
-  };
 }
 
 export function buildAskCard(state: AskCardState): object {
@@ -231,7 +218,6 @@ function resultEntry(item: AskResult): Record<string, unknown> {
   };
   if (item.answer.customInput !== undefined) details.customInput = item.answer.customInput;
   if (item.answer.note !== undefined) details.note = item.answer.note;
-  if (item.answer.timedOut) details.timedOut = true;
   return details;
 }
 
@@ -240,7 +226,6 @@ function answerText(answer: AskAnswer): string {
   if (answer.customInput !== undefined && answer.customInput !== "") parts.push(answer.customInput);
   if (answer.selectedOptions.length) parts.push(answer.selectedOptions.join(", "));
   let text = parts.join(" / ") || "(未选择)";
-  if (answer.timedOut) text += " (auto-selected after timeout)";
   if (answer.note) text += `\nUser added note: ${answer.note}`;
   return text;
 }
@@ -248,11 +233,11 @@ function answerText(answer: AskAnswer): string {
 function answeredText(answer: AskAnswer) {
   const lines: string[] = [];
   if (answer.selectedOptions.length) {
-    lines.push(`✅ 已选：${answer.selectedOptions.join("、")}${answer.timedOut ? "（超时自动选择）" : ""}`);
+    lines.push(`✅ 已选：${answer.selectedOptions.join("、")}`);
   } else if (answer.customInput) {
     lines.push(`✅ 已答：${truncate(answer.customInput, 300)}`);
   } else {
-    lines.push(`✅ 已作答${answer.timedOut ? "（超时自动选择）" : ""}`);
+    lines.push("✅ 已作答");
   }
   if (answer.note) lines.push(`📝 备注：${truncate(answer.note, 300)}`);
   return lines.join("\n");
@@ -293,7 +278,6 @@ function statusText(state: AskCardState): string | undefined {
     return `进度：已答 ${done}/${state.questions.length} 题。${unsubmitted ? "有已勾选但未提交的多选题。" : ""}`;
   }
   if (state.status === "done") return "✅ 问题已全部回答，答案已返回终端会话。";
-  if (state.status === "timeout") return "⏰ 等待超时，未回答的问题已按推荐项自动作答。";
   if (state.status === "terminal") return "🖥 已在终端回答，本卡片已失效。";
   if (state.status === "expired") return "提问已结束：终端会话离线或已切换。";
   return undefined;
@@ -301,7 +285,6 @@ function statusText(state: AskCardState): string | undefined {
 
 function titleForStatus(status: AskCardStatus) {
   if (status === "done") return "✅ 已作答";
-  if (status === "timeout") return "⏰ 超时自动作答";
   if (status === "terminal") return "🖥 已在终端回答";
   if (status === "expired") return "已结束";
   return "❓ 需要你的回答";
@@ -309,7 +292,6 @@ function titleForStatus(status: AskCardStatus) {
 
 function headerTemplate(status: AskCardStatus) {
   if (status === "done") return "green";
-  if (status === "timeout") return "orange";
   return "blue";
 }
 

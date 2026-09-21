@@ -4,14 +4,12 @@ import type { AgentToolResult, AgentToolUpdateCallback, ExtensionAPI, ExtensionC
 import { Type } from "typebox";
 import {
   parseAskQuestions,
-  resolveTimeoutAnswer,
   formatAskDetails,
   formatAskText,
   type AskAnswer,
   type AskQuestion,
   type AskResult,
 } from "../../feishu/ask-card.ts";
-import { loadConfig } from "../../feishu/config.ts";
 import { RelayClient } from "./relay-client.ts";
 import { relayHelp } from "./feishu-help.ts";
 
@@ -405,22 +403,22 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
           if (!fallback) askCancelled(context);
           return askToolResult(fallback.results);
         }
-        const timeoutMs = Math.max(0, loadConfig()?.askTimeoutSec ?? 0) * 1000;
         const runId = randomUUID();
-        const feishu = active.request("ask", { runId, questions }, timeoutMs > 0 ? timeoutMs + 30_000 : 24 * 60 * 60 * 1000)
+        // 提问没有等待上限：只有连接真正断开（网关/终端退出）才结束，请求超时只作为传输层兜底。
+        const feishu = active.request("ask", { runId, questions }, ASK_REQUEST_TIMEOUT_MS)
           .then((response) => {
             const results = readAskAnswers(response, questions);
-            return results ? { source: "feishu" as const, results, timedOut: results.some((item) => item.answer.timedOut === true) } : undefined;
+            return results ? { source: "feishu" as const, results } : undefined;
           })
           // 飞书通道失败不能静默：否则用户只看到终端对话框，不知道话题里为什么没有卡片。
           .catch((error) => {
             ctx?.ui.notify(askChannelNotice(error), "warning");
             return undefined;
           });
-        const tui = withAskTimeout(runTuiChannel(context, questions, controller.signal), timeoutMs, questions, () => controller.abort());
+        const tui = runTuiChannel(context, questions, controller.signal);
         const winner = await raceFirst([feishu, tui]);
         if (winner?.source === "feishu") controller.abort();
-        else if (winner) void active.request("askCancel", { runId, timeout: winner.timedOut === true }, 8_000).catch(() => {});
+        else if (winner) void active.request("askCancel", { runId }, 8_000).catch(() => {});
         if (!winner) {
           void active.request("askCancel", { runId }, 8_000).catch(() => {});
           askCancelled(context);
@@ -482,7 +480,10 @@ function formatResult(action: string, result: any, echo: boolean) {
   return action === "status" ? `${bound}\n输入镜像：${echo ? "开启" : "关闭"}` : bound;
 }
 
-type ChannelResult = { source: "feishu" | "tui"; results: AskResult[]; timedOut?: boolean };
+type ChannelResult = { source: "feishu" | "tui"; results: AskResult[] };
+
+/** 传输层兜底：正常路径由连接断开或用户作答结束，这里只防住一个永不回来的请求。 */
+const ASK_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 /**
  * 宿主提供的同名内置工具委托入口。omp 在扩展工具 ctx 上暴露 invokeTool（指向被遮蔽的内置 ask），
@@ -517,7 +518,6 @@ function readAskAnswers(response: unknown, questions: AskQuestion[]): AskResult[
         selectedOptions: Array.isArray(selected) ? selected.filter((label): label is string => typeof label === "string") : [],
         customInput: typeof entry?.customInput === "string" ? entry.customInput : undefined,
         note: typeof entry?.note === "string" ? entry.note : undefined,
-        timedOut: entry?.timedOut === true ? true : undefined,
       },
     };
   });
@@ -533,31 +533,6 @@ function raceFirst(candidates: Array<Promise<ChannelResult | undefined>>): Promi
         else if (--remaining === 0) resolve(undefined);
       });
     }
-  });
-}
-
-/** 终端通道的超时兜底：到点按推荐项作答（与原生 ask 的超时语义一致）并收起已打开的对话框。 */
-function withAskTimeout(
-  channel: Promise<ChannelResult | undefined>,
-  timeoutMs: number,
-  questions: AskQuestion[],
-  onTimeout: () => void,
-): Promise<ChannelResult | undefined> {
-  if (timeoutMs <= 0) return channel;
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      onTimeout();
-      resolve({
-        source: "tui",
-        timedOut: true,
-        results: questions.map((question) => ({ question, answer: resolveTimeoutAnswer(question, undefined) })),
-      });
-    }, timeoutMs);
-    timer.unref?.();
-    void channel.then((value) => {
-      clearTimeout(timer);
-      resolve(value);
-    });
   });
 }
 

@@ -167,7 +167,6 @@ export const DEFAULT_CONFIG: Pick<
   | "quotedMessageMaxChars"
   | "promptNotifySec"
   | "promptTimeoutSec"
-  | "askTimeoutSec"
   | "askNotifySec"
   | "sendMaxRetries"
   | "streamingReply"
@@ -197,7 +196,6 @@ export const DEFAULT_CONFIG: Pick<
   quotedMessageMaxChars: 8000,
   promptNotifySec: 180,
   promptTimeoutSec: 0,
-  askTimeoutSec: 0,
   askNotifySec: 0,
   sendMaxRetries: 2,
   streamingReply: true,
@@ -315,7 +313,6 @@ function applyRuntimeDefaults(cfg: FeishuConfig): FeishuConfig {
     quotedMessageMaxChars: cfg.quotedMessageMaxChars ?? DEFAULT_CONFIG.quotedMessageMaxChars,
     promptNotifySec: numberOr(cfg.promptNotifySec, DEFAULT_CONFIG.promptNotifySec!),
     promptTimeoutSec: numberOr(cfg.promptTimeoutSec, DEFAULT_CONFIG.promptTimeoutSec!),
-    askTimeoutSec: numberOr(cfg.askTimeoutSec, DEFAULT_CONFIG.askTimeoutSec!),
     askNotifySec: numberOr(cfg.askNotifySec, DEFAULT_CONFIG.askNotifySec!),
     sendMaxRetries: cfg.sendMaxRetries ?? DEFAULT_CONFIG.sendMaxRetries,
     streamingReply: cfg.streamingReply ?? DEFAULT_CONFIG.streamingReply,
@@ -363,7 +360,6 @@ export function loadBaseConfig(): FeishuConfig | undefined {
       quotedMessageMaxChars: parsePositiveInt(env("QUOTED_MESSAGE_MAX_CHARS"), DEFAULT_CONFIG.quotedMessageMaxChars!),
       promptNotifySec: parseEnvSeconds(env("PROMPT_NOTIFY_SEC")) ?? DEFAULT_CONFIG.promptNotifySec!,
       promptTimeoutSec: parseEnvSeconds(env("PROMPT_TIMEOUT_SEC")) ?? DEFAULT_CONFIG.promptTimeoutSec!,
-      askTimeoutSec: parseEnvSeconds(env("ASK_TIMEOUT_SEC")) ?? DEFAULT_CONFIG.askTimeoutSec!,
       askNotifySec: parseEnvSeconds(env("ASK_NOTIFY_SEC")) ?? DEFAULT_CONFIG.askNotifySec!,
       sendMaxRetries: parsePositiveInt(env("SEND_MAX_RETRIES"), DEFAULT_CONFIG.sendMaxRetries!),
       streamingReply: parseBool(env("STREAMING_REPLY"), DEFAULT_CONFIG.streamingReply!),
@@ -399,7 +395,6 @@ export function loadBaseConfig(): FeishuConfig | undefined {
     quotedMessageMaxChars: cfg.quotedMessageMaxChars,
     promptNotifySec: numberOr(cfg.promptNotifySec, DEFAULT_CONFIG.promptNotifySec!),
     promptTimeoutSec: numberOr(cfg.promptTimeoutSec, DEFAULT_CONFIG.promptTimeoutSec!),
-    askTimeoutSec: numberOr(cfg.askTimeoutSec, DEFAULT_CONFIG.askTimeoutSec!),
     askNotifySec: numberOr(cfg.askNotifySec, DEFAULT_CONFIG.askNotifySec!),
     sendMaxRetries: cfg.sendMaxRetries,
     streamingReply: cfg.streamingReply,
