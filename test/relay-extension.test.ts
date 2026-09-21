@@ -49,6 +49,12 @@ async function fixture(t: any) {
     registerTool(tool: any) { tools.push(tool); },
     sendUserMessage(text: string, options: any) { inputs.push({ text, options }); },
     getSessionName() { return sessionName; },
+    // omp 会把扩展命令送进 input 事件，插件用命令表区分命令与技能/模板
+    getCommands: () => [
+      { name: "feishu", source: "extension", description: "飞书" },
+      { name: "skill:demo", source: "skill" },
+      { name: "template", source: "prompt" },
+    ],
   };
   const ctx: any = {
     mode: "tui",
@@ -253,9 +259,12 @@ test("接力扩展：正常退出推送对话关闭提示（默认开），切�
   const f = await fixture(t);
   await f.emitAsync("input", { text: "开始", source: "interactive" });
   await waitFor(() => f.journal.length === 1);
-  // /new、/resume、/fork、/reload 也会触发 session_shutdown，但话题仍由后继会话使用
-  await f.emitAsync("session_shutdown", { reason: "resume" });
-  assert.equal(f.journal.length, 1, "切换会话不发关闭提示");
+  // pi 的 /new、/resume、/fork、/reload 都会先发 session_shutdown，但话题仍由后继会话使用；
+  // 只有 reason=quit 才是真退出。
+  for (const reason of ["new", "resume", "fork", "reload"]) {
+    await f.emitAsync("session_shutdown", { reason });
+  }
+  assert.equal(f.journal.length, 1, "切换会话与 reload 都不发关闭提示");
 });
 
 test("接力扩展：退出时话题收到关闭提示，exit-notice off 后不再推送", async (t) => {
@@ -270,4 +279,116 @@ test("接力扩展：退出时话题收到关闭提示，exit-notice off 后不�
   await f.emitAsync("session_shutdown", { reason: "quit" });
   assert.equal(f.journal.length, 2, "关闭开关后退出不再推送");
   await assert.rejects(f.command("exit-notice", f.ctx), /relay/);
+});
+
+test("接力扩展：omp 进程内切换会话跟随新会话，旧会话连接被释放", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "第一会话", source: "interactive" });
+  await waitFor(() => (f.status.get("feishu-relay") ?? "").includes("第一会话"));
+  assert.equal(f.topicCount(), 1);
+
+  // omp 的 /new 只发 session_switch（没有 session_start），接力要跟着换会话
+  f.switchTo("session-two");
+  await f.emitAsync("session_switch", { reason: "new", previousSessionFile: "/ws/demo-project/first.jsonl" });
+  await waitFor(() => (f.status.get("feishu-relay") ?? "").includes("未绑定"));
+  await f.emitAsync("input", { text: "第二会话", source: "interactive" });
+  await waitFor(() => f.topicCount() === 2);
+  await waitFor(() => (f.status.get("feishu-relay") ?? "").includes("第二会话"));
+  assert.equal(f.inputs.length, 0, "新会话尚未收到飞书输入");
+
+  // 旧话题不再有终端接管：网关给出明确回执，而不是静默丢弃
+  await f.incoming("after-switch", "omt_1");
+  assert.ok(
+    f.notices.some((text) => text.includes("已离线")),
+    "旧会话的话题应由网关回执终端已离线",
+  );
+});
+
+test("接力扩展：session_switch resume 复用原话题，不重复建话题", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "第一会话", source: "interactive" });
+  await waitFor(() => f.journal.length === 1);
+
+  f.switchTo("session-two");
+  await f.emitAsync("session_switch", { reason: "new" });
+  await f.emitAsync("input", { text: "第二会话", source: "interactive" });
+  await waitFor(() => f.topicCount() === 2);
+
+  // 切回第一会话：网关按 sessionId 返回既有绑定，状态栏直接回到原话题
+  f.switchTo("session-one");
+  await f.emitAsync("session_switch", { reason: "resume" });
+  await waitFor(() => (f.status.get("feishu-relay") ?? "").includes("demo-project:第一会话"));
+  assert.equal(f.topicCount(), 2, "resume 不新建话题");
+
+  await f.emitAsync("input", { text: "回到第一会话", source: "interactive" });
+  await f.emit("agent_start");
+  await f.emit("message_end", assistant("第一会话答案"));
+  await f.emit("agent_end");
+  await waitFor(() => f.cards.some((card) => card.card.elements[0].content === "第一会话答案"));
+  assert.equal(
+    f.cards.find((card) => card.card.elements[0].content === "第一会话答案")?.root,
+    "om_1",
+    "正式回复回到原话题",
+  );
+});
+
+test("接力扩展：同一会话重复触发沿用原连接（ctx.reload 语义）", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "第一条", source: "interactive" });
+  await waitFor(() => f.journal.length === 1);
+  const bound = f.status.get("feishu-relay");
+
+  // omp 的 ctx.reload() 就是 session_switch reason=resume，且会话 id 不变：
+  // 重注册既无必要，又可能被网关以「同一会话已在另一个终端连接」拒绝
+  await f.emitAsync("session_switch", { reason: "resume" });
+  await f.emitAsync("session_switch", { reason: "resume" });
+  assert.equal(f.status.get("feishu-relay"), bound, "同一会话沿用原连接");
+  assert.equal(
+    f.notices.filter((text) => text.includes("已在另一个终端连接")).length,
+    0,
+    "重复触发不重注册，也不会拿到重复注册错误",
+  );
+
+  await f.incoming("after-reload");
+  assert.deepEqual(f.inputs, [{ text: "来自飞书", options: { deliverAs: "steer" } }], "沿用连接后飞书输入仍然可用");
+  assert.equal(f.topicCount(), 1);
+});
+
+test("接力扩展：omp 的无 reason 关闭事件按退出处理", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "开始", source: "interactive" });
+  await waitFor(() => f.journal.length === 1);
+  // omp 的 session_shutdown 没有 reason 字段，且只在进程退出时发出
+  await f.emitAsync("session_shutdown", {});
+  assert.match(f.journal[1], /^text:🔚 对话已关闭/, "无 reason（omp）同样推关闭提示");
+});
+
+test("接力扩展：omp 送进来的斜杠命令不建话题也不镜像", async (t) => {
+  const f = await fixture(t);
+  // omp 把宿主命令也当成 interactive 输入送进 input 事件（pi 在输入事件之前拦截）：
+  // 扩展命令与内建命令都不能当话题标题，也不能出现在话题里
+  for (const text of ["/feishu relay setup oc_smoke ou_owner", "/new", "/model gpt-5"]) {
+    await f.emitAsync("input", { text, source: "interactive" });
+  }
+  assert.equal(f.topicCount(), 0, "命令不建话题");
+  assert.deepEqual(f.outbound(), [], "命令不镜像");
+  // 真正的第一条输入照常建话题，标题取自它而不是命令
+  await f.emitAsync("input", { text: "真正的第一条", source: "interactive" });
+  await waitFor(() => f.topicCount() === 1);
+  assert.match(f.status.get("feishu-relay") ?? "", /demo-project:真正的第一条/);
+});
+
+test("接力扩展：以路径开头的正常输入不会被当成命令", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "/Users/me/notes.md 看看这个", source: "interactive" });
+  await waitFor(() => f.outbound().length === 1);
+  assert.deepEqual(f.outbound(), ["text:🖥 输入：/Users/me/notes.md 看看这个"]);
+});
+
+test("接力扩展：技能与模板仍按输入原文处理", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "/skill:demo 用法", source: "interactive" });
+  await waitFor(() => f.topicCount() === 1);
+  await waitFor(() => f.outbound().length === 1);
+  assert.deepEqual(f.outbound(), ["text:🖥 输入：/skill:demo 用法"], "技能输入镜像原文");
 });

@@ -7,5 +7,5 @@ import { fileURLToPath } from "node:url";
 import createPiFeishuExtension from "../../../src/adapters/pi/index.ts";
 
 export default function feishuExtension(pi: any) {
-  return createPiFeishuExtension(pi, { extensionPath: fileURLToPath(import.meta.url) });
+  return createPiFeishuExtension(pi, { extensionPath: fileURLToPath(import.meta.url), runtime: "pi" });
 }

@@ -32,12 +32,16 @@ export const BRIDGE_PI_PATH = join(ROOT_DIR, "bridge.pi.json");
 export const DEDUPE_PI_PATH = join(ROOT_DIR, "dedupe.pi.json");
 export const DEBUG_PI_LOG_PATH = join(ROOT_DIR, "debug.pi.log");
 export const DAEMON_LOG_PATH = join(ROOT_DIR, "daemon.log");
+export const RELAY_STATE_PI_PATH = join(ROOT_DIR, "relay-state.pi.json");
+export const RELAY_ENDPOINT_PI_PATH = join(ROOT_DIR, "relay-endpoint.pi.json");
 
 // ---------- omp 适配器专用路径 ----------
 export const CONFIG_OMP_PATH = join(OMP_ROOT, "config.omp.json");
 export const STATE_OMP_PATH = join(OMP_ROOT, "state.omp.json");
 export const BRIDGE_OMP_PATH = join(OMP_ROOT, "bridge.omp.json");
 export const DEDUPE_OMP_PATH = join(OMP_ROOT, "dedupe.omp.json");
+export const RELAY_STATE_OMP_PATH = join(OMP_ROOT, "relay-state.omp.json");
+export const RELAY_ENDPOINT_OMP_PATH = join(OMP_ROOT, "relay-endpoint.omp.json");
 export const DEBUG_OMP_LOG_PATH = join(OMP_ROOT, "debug.omp.log");
 export const DAEMON_OMP_LOG_PATH = join(OMP_ROOT, "daemon.log");
 
@@ -46,6 +50,8 @@ export const CONFIG_HARNESS_PATH = join(HARNESS_ROOT, "config.harness.json");
 export const STATE_HARNESS_PATH = join(HARNESS_ROOT, "state.harness.json");
 export const BRIDGE_HARNESS_PATH = join(HARNESS_ROOT, "bridge.harness.json");
 export const DEDUPE_HARNESS_PATH = join(HARNESS_ROOT, "dedupe.harness.json");
+export const RELAY_STATE_HARNESS_PATH = join(HARNESS_ROOT, "relay-state.harness.json");
+export const RELAY_ENDPOINT_HARNESS_PATH = join(HARNESS_ROOT, "relay-endpoint.harness.json");
 export const DEBUG_HARNESS_LOG_PATH = join(HARNESS_ROOT, "debug.harness.log");
 
 // ---------- 兼容旧引用（等价于 Pi 版） ----------
@@ -71,6 +77,12 @@ export type RuntimeSource = {
   bridgePath: string;
   dedupePath: string;
   debugLogPath: string;
+  /** daemon 的 stdout/stderr 落点，也是 /feishu status 展示的日志位置 */
+  daemonLogPath: string;
+  /** 终端接力绑定与投递记录 */
+  relayStatePath: string;
+  /** 终端接力网关的本机端口与随机令牌文件 */
+  relayEndpointPath: string;
 };
 
 export const PI_SOURCE: RuntimeSource = {
@@ -81,6 +93,9 @@ export const PI_SOURCE: RuntimeSource = {
   bridgePath: BRIDGE_PI_PATH,
   dedupePath: DEDUPE_PI_PATH,
   debugLogPath: DEBUG_PI_LOG_PATH,
+  daemonLogPath: DAEMON_LOG_PATH,
+  relayStatePath: RELAY_STATE_PI_PATH,
+  relayEndpointPath: RELAY_ENDPOINT_PI_PATH,
 };
 
 export const HARNESS_SOURCE: RuntimeSource = {
@@ -91,6 +106,9 @@ export const HARNESS_SOURCE: RuntimeSource = {
   bridgePath: BRIDGE_HARNESS_PATH,
   dedupePath: DEDUPE_HARNESS_PATH,
   debugLogPath: DEBUG_HARNESS_LOG_PATH,
+  daemonLogPath: join(HARNESS_ROOT, "daemon.log"),
+  relayStatePath: RELAY_STATE_HARNESS_PATH,
+  relayEndpointPath: RELAY_ENDPOINT_HARNESS_PATH,
 };
 
 export const OMP_SOURCE: RuntimeSource = {
@@ -101,6 +119,9 @@ export const OMP_SOURCE: RuntimeSource = {
   bridgePath: BRIDGE_OMP_PATH,
   dedupePath: DEDUPE_OMP_PATH,
   debugLogPath: DEBUG_OMP_LOG_PATH,
+  daemonLogPath: DAEMON_OMP_LOG_PATH,
+  relayStatePath: RELAY_STATE_OMP_PATH,
+  relayEndpointPath: RELAY_ENDPOINT_OMP_PATH,
 };
 
 /** 默认 Pi（向后兼容：Pi 进程无需显式设置）。 */

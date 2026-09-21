@@ -4,12 +4,10 @@ import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { join } from "node:path";
-import { ROOT_DIR } from "../../feishu/config.ts";
 import { RelayGateway } from "./relay-gateway.ts";
 import { registerRelayExtension } from "./relay-extension.ts";
 import { feishuHelp } from "./feishu-help.ts";
-import { BRIDGE_PI_PATH, CHILD_SESSION_ENV, CONFIG_PI_PATH, DAEMON_LOG_PATH, DEBUG_PI_LOG_PATH, DEDUPE_PI_PATH, ensureRoot, getRuntimeSource, loadConfig, mask, ompAgentDir, removePath, OMP_SOURCE, PI_SOURCE, setRuntimeSource, STATE_PI_PATH, writeJson } from "../../feishu/config.ts";
+import { CHILD_SESSION_ENV, ensureRoot, getRuntimeSource, loadConfig, mask, removePath, OMP_SOURCE, PI_SOURCE, setRuntimeSource, writeJson } from "../../feishu/config.ts";
 import { debugLog } from "../../feishu/debug.ts";
 import { FeishuBridgeRuntime } from "../../feishu/bridge-runtime.ts";
 import { FeishuBridgeStore } from "../../feishu/bridge-store.ts";
@@ -35,13 +33,20 @@ import { PiConversationRuntime, handlePiMessageEnd } from "./PiConversationRunti
  * 其余飞书逻辑全部在 src/feishu 公共层。
  *
  * @param options.extensionPath 当前扩展入口文件路径（daemon 用 -e 重新加载它）。
+ * @param options.runtime 宿主运行时；缺省按 pi 处理，omp 入口必须显式传 "omp"。
  */
-export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { extensionPath?: string }) {
+export type PiFeishuRuntime = "pi" | "omp";
+
+export default function createPiFeishuExtension(
+  pi: ExtensionAPI,
+  options?: { extensionPath?: string; runtime?: PiFeishuRuntime },
+) {
   const extensionEntry = options?.extensionPath || fileURLToPath(import.meta.url);
-  // Runtime 选择：daemon/env 显式声明走 omp（独立配置/状态/锁），默认 Pi。
-  // OMPFEISHU_* 是 omp 专属配置前缀（见 config.ts OMP_SOURCE），
+  // 运行时身份由入口文件决定：omp 入口传 "omp"，pi 入口传 "pi"。daemon 用 -e 重新加载的
+  // 就是同一个入口，因此配置/状态/锁的选择随进程继承，不依赖环境变量。
+  // OMPFEISHU_* 前缀只用于读 omp 侧的配置覆盖(见 config.ts OMP_SOURCE)，
   // PI_FEISHU_DAEMON 沿用旧名以减少 daemon 匹配串的改动面。
-  const ompRuntime = process.env.OMPFEISHU_RUNTIME === "1";
+  const ompRuntime = options?.runtime === "omp";
   setRuntimeSource(ompRuntime ? OMP_SOURCE : PI_SOURCE);
   if (process.env[CHILD_SESSION_ENV] === "1") {
     return;
@@ -49,9 +54,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
 
   // 模型可读写白名单配置（热更新 + 落盘）
   registerFeishuConfigTools(pi);
-  const relayEndpointPath = ompRuntime
-    ? join(ompAgentDir(), "feishu", "relay-endpoint.omp.json")
-    : join(ROOT_DIR, "relay-endpoint.pi.json");
+  const relayEndpointPath = getRuntimeSource().relayEndpointPath;
   const relayCommand = process.env.PI_FEISHU_DAEMON === "1" ? undefined : registerRelayExtension(pi, relayEndpointPath);
   let relay: RelayGateway | undefined;
 
@@ -190,7 +193,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
       return relay.handleMessage(msg);
     });
     try {
-      relay = new RelayGateway(join(ROOT_DIR, "relay-state.pi.json"), relayEndpointPath, cfg.appId, transport, (id) => conversations.hasLoadedSession(id));
+      relay = new RelayGateway(getRuntimeSource().relayStatePath, relayEndpointPath, cfg.appId, transport, (id) => conversations.hasLoadedSession(id));
       await relay.start();
       await transport.start();
       gatewayLock.startHeartbeat();
@@ -229,7 +232,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
       ctx.ui.notify(withBuildTag(`飞书连接已在后台运行。\n${formatOwner(result.owner)}`), "info");
       return;
     }
-    ctx.ui.notify(withBuildTag(`飞书连接已启动。\nGateway pid=${result.pid}\nLog: ${DAEMON_LOG_PATH}`), "info");
+    ctx.ui.notify(withBuildTag(`飞书连接已启动。\nGateway pid=${result.pid}\nLog: ${getRuntimeSource().daemonLogPath}`), "info");
   }
 
   function quoteShell(value: string) {
@@ -293,7 +296,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
 
       reapDetachedDaemonProcesses({ keepPids: [process.pid] });
       ensureRoot();
-      const logFd = openSync(DAEMON_LOG_PATH, "a");
+      const logFd = openSync(getRuntimeSource().daemonLogPath, "a");
       let child: ChildProcess;
       if (process.platform === "win32") {
         // Windows 上 spawn("bash", ...) 可能解析到 WSL 的 bash.exe（而非 Git Bash），
@@ -380,7 +383,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
         if (cmd === "setup") {
           const configToStart = await runSetup(ctx);
           if (configToStart) {
-            writeJson(CONFIG_PI_PATH, configToStart);
+            // 配置由 setup 按当前运行时写入（pi/omp 各写各的），这里只负责起网关。
             notifyDaemonStartResult(ctx, await startDaemon(false));
           }
           refreshStatusFromState();
@@ -410,7 +413,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
             refreshStatusFromState();
             return;
           }
-          ctx.ui.notify(`飞书连接已重启，最新代码和配置已生效。\nOwner: ${formatOwner(result.started.owner)}\nLog: ${DAEMON_LOG_PATH}`, "info");
+          ctx.ui.notify(`飞书连接已重启，最新代码和配置已生效。\nOwner: ${formatOwner(result.started.owner)}\nLog: ${getRuntimeSource().daemonLogPath}`, "info");
           refreshStatusFromState();
           return;
         }
@@ -425,11 +428,12 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
             return;
           }
           await stopDaemon();
-          removePath(CONFIG_PI_PATH);
-          removePath(STATE_PI_PATH);
-          removePath(DEDUPE_PI_PATH);
-          removePath(`${DEDUPE_PI_PATH}.lock`);
-          removePath(BRIDGE_PI_PATH);
+          const resetSource = getRuntimeSource();
+          removePath(resetSource.configPath);
+          removePath(resetSource.statePath);
+          removePath(resetSource.dedupePath);
+          removePath(`${resetSource.dedupePath}.lock`);
+          removePath(resetSource.bridgePath);
           conversations.resetMemory();
           messageHandler.reset();
           ensureRoot();
@@ -450,21 +454,21 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
               `Status: ${lastStatusText || (loadConfig() ? "Feishu: disconnected" : "Feishu: not configured")}`,
               `Gateway owner: ${formatOwner(owner)}`,
               `Config: ${cfg ? `${cfg.domain}, appId=${mask(cfg.appId)}, groupPolicy=${cfg.groupPolicy}, autoStart=${cfg.autoStart !== false}` : "missing"}`,
-              `Path: ${CONFIG_PI_PATH}`,
+              `Path: ${getRuntimeSource().configPath}`,
               `Gateway lock: ${gatewayLockPath()}`,
-              `Debug: ${DEBUG_PI_LOG_PATH}`,
-              `Gateway log: ${DAEMON_LOG_PATH}`,
+              `Debug: ${getRuntimeSource().debugLogPath}`,
+              `Gateway log: ${getRuntimeSource().daemonLogPath}`,
             ].join("\n"),
             "info",
           );
           return;
         }
         if (cmd === "debug") {
-          if (!existsSync(DEBUG_PI_LOG_PATH)) {
+          if (!existsSync(getRuntimeSource().debugLogPath)) {
             ctx.ui.notify("还没有飞书调试日志。请先在飞书里发一条消息给机器人。", "info");
             return;
           }
-          const lines = readFileSync(DEBUG_PI_LOG_PATH, "utf8").trim().split("\n").slice(-20);
+          const lines = readFileSync(getRuntimeSource().debugLogPath, "utf8").trim().split("\n").slice(-20);
           ctx.ui.notify(lines.join("\n"), "info");
           return;
         }
@@ -475,7 +479,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
             return;
           }
           cfg.autoStart = cfg.autoStart === false;
-          writeJson(CONFIG_PI_PATH, cfg);
+          writeJson(getRuntimeSource().configPath, cfg);
           ctx.ui.notify(cfg.autoStart ? "飞书自动启动已开启。" : "飞书自动启动已关闭。", "info");
           refreshStatusFromState();
           return;

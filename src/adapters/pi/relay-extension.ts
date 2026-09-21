@@ -5,8 +5,21 @@ import { Type } from "typebox";
 import { RelayClient } from "./relay-client.ts";
 import { relayHelp } from "./feishu-help.ts";
 
-/** 自动绑定只在真正新开的会话发生：全新启动、/new、fork；resume 复用原绑定。 */
-const AUTOBIND_REASONS = new Set(["startup", "new", "fork"]);
+/**
+ * omp 用独立的 session_switch 事件表达会话切换（pi 没有该事件，用 session_start 的
+ * reason 表达）。这里只声明用到的那一个重载：本包的编译依赖是 pi 的 ExtensionAPI，
+ * 为一个 omp 事件放宽整个宿主类型得不偿失。两个宿主的 on() 都不校验事件名
+ * （pi 存进 Map，omp 的签名是 event: string），所以该订阅在 pi 上只是永不触发。
+ */
+type SessionSwitchHost = {
+  on(event: "session_switch", handler: (event: { reason?: string }, context: ExtensionContext) => void): unknown;
+};
+
+/**
+ * 网关拒绝同一会话重复注册时的错误片段。旧连接关闭到网关摘除 sessions 之间只隔一个
+ * 异步 socket close 事件，detach 后立刻重连同一会话可能撞上这段窗口。
+ */
+const DUPLICATE_SESSION_ERROR = "同一会话已在另一个终端连接";
 
 /** 本地终端输入的镜像前缀：话题里必须一眼看出这是本机输入而不是模型回复。 */
 const ECHO_PREFIX = "🖥 输入：";
@@ -48,11 +61,48 @@ export function relayTitle(sessionName: string | undefined, firstInput: string |
   return `${folder}:${name || input || "未命名"}`.slice(0, 80);
 }
 
+/**
+ * 输入是不是斜杠命令。omp 把宿主命令（/new、/feishu …）也当作 interactive 输入
+ * 送进 input 事件，pi 则在输入事件之前拦截：命令不建话题也不镜像，否则话题里会
+ * 出现「🖥 输入：/new」这类命令行文本，标题也可能取自命令行。
+ *
+ * 判断口径：首 token 形如 `/名字`（名字里不再出现 `/`，所以 "/Users/me/x.md 看看"
+ * 这类以路径开头的正常输入不会误判）；再查命令表——技能与模板（source 为
+ * skill/prompt）按文档要继续镜像为输入原文，其余（扩展命令与宿主内建命令）都算命令。
+ */
+function isCommandInput(pi: ExtensionAPI, text: string) {
+  const name = /^\s*\/([A-Za-z][\w:-]*)(?:\s|$)/.exec(text)?.[1];
+  if (!name || typeof pi.getCommands !== "function") return false;
+  try {
+    const known = pi.getCommands().find((command) => command.name === name);
+    return known ? known.source === "extension" : true;
+  } catch {
+    // 宿主未提供命令表时按普通输入处理，不拦。
+    return false;
+  }
+}
+
+/** 订阅 omp 的会话切换事件；pi 没有这个事件，注册后不会触发。 */
+function onSessionSwitch(pi: ExtensionAPI, handler: (context: ExtensionContext) => void) {
+  // pi 的类型里没有 session_switch，取用 omp 侧的形状；运行时两个宿主都只是登记回调。
+  (pi as unknown as SessionSwitchHost).on("session_switch", (_event, context) => handler(context));
+}
+
+/** ping 失败于重复注册时重试一次，其余错误原样抛出（未启动网关等按原路径提示）。 */
+async function connectRelay(active: RelayClient) {
+  try {
+    await active.request("ping");
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes(DUPLICATE_SESSION_ERROR)) throw error;
+    await delay(300);
+    await active.request("ping");
+  }
+}
+
 export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
   let ctx: ExtensionContext | undefined;
   let client: RelayClient | undefined;
   let sessionId: string | undefined;
-  let pendingAuto = false;
   let heartbeat: NodeJS.Timeout | undefined;
   let turnId: string | undefined;
   let replies = 0;
@@ -117,16 +167,26 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     // 断连后不再补发排队消息：旧话题已不可达，补发只会打乱话题内的顺序。
     outEpoch++;
     sendFailures = 0;
-    pendingAuto = false;
     client?.close();
     client = undefined;
     ctx?.ui.setStatus("feishu-relay", undefined);
   }
 
-  function attach(context: ExtensionContext, autoEligible = false) {
+  /**
+   * 连接当前会话的接力：进程启动、重开旧会话、进程内切会话、显式 /feishu relay 都走这里。
+   * 同一会话重复触发（扩展触发的 ctx.reload()、重复命令）沿用现有连接：重注册既无必要，
+   * 又会在旧连接尚未被网关摘除时被拒。
+   */
+  function attach(context: ExtensionContext) {
+    const target = context.sessionManager.getSessionId();
+    if (sessionId === target && client?.connected) {
+      ctx = context;
+      status();
+      return;
+    }
     detach();
     ctx = context;
-    sessionId = ctx.sessionManager.getSessionId();
+    sessionId = target;
     if (ctx.mode !== "tui" || !ctx.hasUI || !ctx.sessionManager.getSessionFile()) return;
     const id = sessionId;
     const received = new Set<string>();
@@ -142,8 +202,6 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
       ctx.ui.notify(busy ? "飞书消息已收到，将引导当前任务。" : "飞书消息已收到。", "info");
       return { accepted: true, busy };
     }, status);
-    // 网关还没配置时 register 也能成功，binding 为 undefined；自动绑定延迟到首条消息。
-    pendingAuto = autoEligible && !client.binding?.enabled;
     const active = client;
     let checking = false;
     const check = async () => {
@@ -151,7 +209,7 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
       checking = true;
       try {
         // ping 顺带刷新输入镜像开关，终端不必额外探测。
-        await active.request("ping");
+        await connectRelay(active);
       }
       catch (error) {
         // 未启动网关时不重复弹窗；状态栏显示离线，显式命令返回具体错误。
@@ -163,15 +221,16 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     heartbeat.unref?.();
   }
 
-  // omp 的 session_start/session_shutdown 事件没有 reason 字段；
-  // 新会话 autobind 改由首条 input 的 pendingAuto 逻辑完成（初始即为待绑定），
-  // /new、/resume、/fork 后由 session_switch 重新置为待绑定；首次启动时
-  // attach() 的 autoEligible 直接尝试。退出提示在 omp 上改为无条件推送，
-  // 网关或网络异常时仍有 EXIT_NOTICE_TIMEOUT_MS 兜底，不会卡退出。
-  pi.on("session_start", (_event, context) => attach(context, AUTOBIND_REASONS.has(process.env.PI_FEISHU_RELAY_NEW ?? "startup")));
-  pi.on("session_shutdown", async () => {
+  // 会话边界统一走 attach()：进程启动与重开旧会话走 session_start（两个宿主都有），
+  // omp 进程内切会话走 session_switch（/new、/resume、/fork 都只发这一个事件）。
+  pi.on("session_start", (_event, context) => attach(context));
+  onSessionSwitch(pi, attach);
+  pi.on("session_shutdown", async (event) => {
     const active = client;
-    if (active?.binding?.enabled && active.exitNotice) {
+    // omp 的 session_shutdown 没有 reason 且只在退出时发出；pi 的带 reason，
+    // 切会话（new/resume/fork）与 /reload 复用同一事件，只有 quit 才是真退出。
+    const reason = (event as { reason?: string } | undefined)?.reason;
+    if ((reason === undefined || reason === "quit") && active?.binding?.enabled && active.exitNotice) {
       await Promise.race([
         enqueueFinal((current) => current.request("push", { text: EXIT_NOTICE }, EXIT_NOTICE_TIMEOUT_MS)),
         delay(EXIT_NOTICE_TIMEOUT_MS, undefined, { ref: false }),
@@ -183,13 +242,16 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
   pi.on("input", async (event) => {
     // 只有用户在终端里真正敲进来的输入才算：飞书注入（extension）与 RPC 既不建话题也不回显。
     if (!ctx || event.source !== "interactive") return { action: "continue" };
+    // 斜杠命令不是用户输入：既不建话题也不镜像。
+    if (isCommandInput(pi, event.text)) return { action: "continue" };
     const active = client;
-    if (pendingAuto) {
-      pendingAuto = false;
+    // 建话题只看当前有没有启用中的绑定，不看这是第几条输入：omp 会把扩展命令
+    // （如 /feishu relay setup）也送进 input 事件，一次性标志会让这类会话永远建不出话题。
+    if (active && active.binding?.enabled !== true) {
       try {
         // 阻塞首条消息直到绑定完成，避免第一轮回答赶不上话题建立而漏发。
         const title = relayTitle(ctx.sessionManager.getSessionName(), event.text, ctx.cwd);
-        const result = await active?.request("autobindTopic", { title, firstInput: storedInput(event.text) });
+        const result = await active.request("autobindTopic", { title, firstInput: storedInput(event.text) });
         if (result?.created) status();
       } catch {
         // 网关未运行/未配置/创建失败：静默跳过，不打断用户输入；状态栏已是离线。
@@ -207,9 +269,15 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     return { action: "continue" };
   });
 
-  // omp 没有 session_info_changed / session_switch 事件：会话改名不再同步
-  // 到话题标题，/new、/resume、/fork 后也不自动重建绑定。话题标题只由
-  // autobind 时的首条输入/会话名决定；需要换绑时手动 /feishu relay 重连。
+  pi.on("session_info_changed", (event) => {
+    const active = client;
+    if (!ctx || !active?.connected || !active.binding?.enabled) return;
+    // 名字清空时回退到首条输入，否则标题会一直挂着旧名字。
+    const title = relayTitle(event.name, active.binding.firstInput, ctx.cwd);
+    void active.request("rename", { title }).catch(notify);
+  });
+  // omp 没有 session_info_changed 事件：omp 上标题只在建话题时定型，改名不同步
+  // （见 docs/pi-session-relay.md 的 omp 差异一节）。
 
   pi.on("agent_start", () => { turnId = randomUUID(); replies = 0; answered = false; });
   pi.on("message_end", (event) => {

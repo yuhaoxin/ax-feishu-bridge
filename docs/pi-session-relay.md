@@ -56,6 +56,16 @@ pi install git:github.com/yuhaoxin/ax-feishu-bridge@feat/feishu-session-handoff
 - 接力话题目前只接收文本（含纯文本富文本消息），不下载图片、文件或展开引用附件。斜杠命令作为普通输入送入 Pi，不执行飞书的 `/resume` 等后台管理命令。
 - 普通、未绑定的飞书会话保持原有后台聊天行为；本功能的单账号限制只保护接力话题，不改变其他会话的访问策略。
 
+## omp 差异
+
+omp 复用同一份接力实现，data 目录、锁与日志都在 `~/.omp/agent` 下，与 Pi 完全隔离。行为差异都来自宿主事件面不同：
+
+- **会话切换事件**：omp 在进程内切换会话（`/new`、`/resume`、`/fork`）只发 `session_switch`，不发 `session_start`；pi 走 `session_start` 的 `reason`。两条路径都重新接线：切到哪个会话就跟到哪个会话，该会话有历史绑定就复用原话题，没有就在下一条真实输入时建新话题。切走时旧会话的连接当场释放，旧话题里再发消息会收到「绑定的 Pi TUI 已离线」。
+- **进程内 resume 与 reload**：omp 上没有 `/reload` 命令，`/reload-plugins` 也不触发接力事件；扩展自己调用的 `ctx.reload()` 表现为 `session_switch` + `reason=resume`，会话 id 不变，此时沿用现有连接，不会重连掉线。
+- **退出通知**：omp 的 `session_start`/`session_shutdown` 没有 `reason` 字段，且只在进程退出时发 `session_shutdown`，因此收到即视为退出；pi 的两个事件都带 `reason`，切会话（`new`/`resume`/`fork`）与 `reload` 复用同一事件，只有 `reason=quit` 才推关闭提示。
+- **会话改名**：omp 没有 `session_info_changed` 事件，话题标题只在建话题时按「目录名:会话名或首条输入」定型，之后改名不同步。
+- **斜杠命令**：omp 把宿主命令（内建 `/new`、扩展 `/feishu ...`）也当作终端输入送进 `input` 事件，而 pi 在输入事件之前就拦截。命令不建话题也不镜像，避免话题里出现命令行文本；`/skill:` 与模板仍按输入原文镜像。
+
 ## 正式回复
 
 每条正常完成且不含工具调用的助手消息都会即时同步到话题，而不只是最后一轮：思考块、工具参数、工具结果、失败或取消的草稿、流式中间内容都不发送。支持阶段标记的模型只保留 `final_answer`，过滤 `commentary`。同一轮里模型给出多条正式答案时按顺序各发一张卡片。整轮没有正式答案（被中止、出错或只跑工具）时，话题里会收到一条纯文本说明，不会静默。
@@ -74,6 +84,8 @@ pi install git:github.com/yuhaoxin/ax-feishu-bridge@feat/feishu-session-handoff
 | --- | --- |
 | `~/.pi/agent/feishu/relay-state.pi.json` | 机器人 ID、授权账号、绑定（含解绑记录）、投递记录 |
 | `~/.pi/agent/feishu/relay-endpoint.pi.json` | 网关本机端口和随机令牌，不应分享或提交 |
+| `~/.omp/agent/feishu/relay-state.omp.json` | omp 侧的同一份接力状态 |
+| `~/.omp/agent/feishu/relay-endpoint.omp.json` | omp 侧的网关端口与令牌 |
 
 入站消息先记录再注入，故障后不会重试可能已执行过的指令。投递确认仅表示终端调用了消息注入接口，不表示模型或工具已完成。断联、超时或失败时可能已接收或部分发送，需要检查终端/飞书后再决定是否重发；不宣称“恰好执行一次”。
 
@@ -90,4 +102,4 @@ npm run build
 npm test
 ```
 
-上游测试脚本使用 `--experimental-transform-types`，请用 Node 24 运行；Node 26 已删除该参数。测试覆盖真实环回 TCP、多会话隔离、账号校验、去重、离线和解绑拒绝、重连、正式回复过滤，以及真实 Pi SDK 配合本地模型 HTTP 替身的端到端处理。测试不使用生产机器人凭证，也不向飞书外发。
+上游测试脚本使用 `--experimental-transform-types`，请用 Node 24 运行（`npx -y node@24 ...`）；Node 26 已删除该参数。用 Bun 跑可以做粗筛，但 `test/gateway-lock.test.ts` 会因 Bun 在进程启动时缓存 `homedir()`（运行时改 `process.env.HOME` 不生效）出现一项假失败。测试覆盖真实环回 TCP、多会话隔离、账号校验、去重、离线和解绑拒绝、重连、正式回复过滤，以及真实 Pi SDK 配合本地模型 HTTP 替身的端到端处理。测试不使用生产机器人凭证，也不向飞书外发。

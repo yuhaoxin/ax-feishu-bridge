@@ -134,6 +134,26 @@ pi install git:github.com/AX1202/ax-feishu-bridge
 
 ---
 
+### omp
+
+omp 使用同一份适配器代码，但数据目录、连接锁与日志都在 `~/.omp/agent/feishu/` 下，与 Pi 完全隔离，两边可以各自接一个机器人并行运行。
+
+#### 1. 安装
+
+```bash
+omp plugin install github:yuhaoxin/ax-feishu-bridge#omp
+```
+
+`#omp` 是带分支的 git 源（不会自动跟随新提交）；需要更新时重跑同一条命令即可。
+
+#### 2. 初始化配置 / 启动 / 聊天
+
+与 Pi 相同：`/feishu setup` → `/feishu start` → 在飞书里直接对话。omp 侧不需要任何环境变量：入口文件自己声明运行时，插件的后台进程也继承同一份身份。
+
+> 同一个机器人（App ID）只应在一个运行时里启用。Pi 与 omp 各持一份连接锁，两端都启动时都会显示连接成功，但飞书事件只会送达其中一边。
+
+---
+
 # Windows 上运行 Pi Agent 飞书插件配置方法
 
 ## 解决方法
@@ -274,6 +294,12 @@ Windows PATH 加入 C:\Program Files\Git\bin
 
 ***
 
+## omp 里怎么管理
+
+omp 的命令与 Pi 完全一致（`/feishu setup`、`start`、`stop`、`restart`、`status`、`autostart`、`debug`、`reset`，以及 `/feishu relay ...` 接力命令），只是读写 `~/.omp/agent/feishu/` 下的配置与状态。
+
+***
+
 ## DSH 里怎么管理
 
 在 DSH 的 web 输入框或终端里输入（依赖宿主 DSH 的命令能力；宿主未提供时会静默跳过，不影响桥接本身）：
@@ -297,10 +323,12 @@ Windows PATH 加入 C:\Program Files\Git\bin
 配置默认保存在：
 
 ```text
-~/.pi/agent/feishu/config.json
+~/.pi/agent/feishu/config.pi.json
 ```
 
-也可以通过环境变量配置：
+omp 侧保存在 `~/.omp/agent/feishu/config.omp.json`，DSH 侧保存在 `~/.dsh/feishu/config.harness.json`。
+
+也可以通过环境变量配置（按运行时加前缀：上表是 Pi 的 `FEISHU_`，omp 用 `OMPFEISHU_`，DSH 用 `HARNESS_`）：
 
 | 变量                    | 说明                            |
 | --------------------- | ----------------------------- |
@@ -316,7 +344,7 @@ Windows PATH 加入 C:\Program Files\Git\bin
 | `FEISHU_AUTO_START`   | `1` 或 `0`                     |
 | `FEISHU_CARD_ACTION_MODE` | `webhook` 或 `ws`，默认 `webhook` |
 | `FEISHU_CARD_ACTION_WEBHOOK_HOST` | 卡片回调监听地址，默认 `0.0.0.0` |
-| `FEISHU_CARD_ACTION_WEBHOOK_PORT` | 卡片回调端口，默认 `3001`（DSH 用 `HARNESS_CARD_ACTION_WEBHOOK_PORT`，默认 `3002`） |
+| `FEISHU_CARD_ACTION_WEBHOOK_PORT` | 卡片回调端口，默认 `3001`（omp 用 `OMPFEISHU_CARD_ACTION_WEBHOOK_PORT`，默认 `3002`；DSH 用 `HARNESS_CARD_ACTION_WEBHOOK_PORT`，默认 `3003`） |
 | `FEISHU_CARD_ACTION_WEBHOOK_PATH` | 卡片回调路径，默认 `/webhook/card` |
 | `FEISHU_PROMPT_NOTIFY_SEC` | 长任务超过多少秒后在飞书发一条“仍在处理中”提示，默认 `180`，`0` 关闭 |
 | `FEISHU_PROMPT_TIMEOUT_SEC` | 任务硬超时秒数，超时后中止任务并报失败，默认 `0`（不设硬超时，长期运行也不会被报失败） |
@@ -369,9 +397,11 @@ Windows PATH 加入 C:\Program Files\Git\bin
 | `~/.pi/agent/feishu/debug.log`   | 调试日志              |
 | `~/.pi/agent/locks.json`         | 当前飞书连接的 owner 锁   |
 | `~/.pi/agent/sessions/`          | 每个飞书会话对应的 Pi 会话文件 |
+| `~/.omp/agent/feishu/`           | omp 侧的配置、状态、接力绑定与日志          |
+| `~/.omp/agent/locks.json`        | omp 侧的飞书连接 owner 锁              |
 | `~/.dsh/feishu/`                 | DSH 侧的配置、状态与日志（仅安装 DSH 时产生；未装 Pi 的机器不会创建 `~/.pi`） |
 
-> 连接锁选址：机器上装有 Pi（存在 `~/.pi/agent` 目录）时沿用 `~/.pi/agent/locks.json`，保证两边能协商同一个机器人的连接；纯 DSH 环境则使用 `~/.dsh/locks.json`。
+> 连接锁选址：omp 固定用 `~/.omp/agent/locks.json`；其余环境在装有 Pi（存在 `~/.pi/agent` 目录）时沿用 `~/.pi/agent/locks.json`，纯 DSH 环境使用 `~/.dsh/locks.json`。两个运行时各持一份锁，互不协商，所以同一个机器人只应在一个运行时里启用。
 
 ***
 

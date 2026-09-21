@@ -65,7 +65,7 @@
   },
   "omp": {
     "extensions": [
-      "./.pi/extensions/feishu/index.ts"
+      "./.pi/extensions/feishu/omp.ts"
     ]
   },
   "dsh": {
