@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, ReadStream, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -36,6 +36,60 @@ test("飞书传输：创建话题验证群主，出站指定 thread 且校验业
   assert.equal(calls.length, count + 1, "不能自动重试创建话题");
   response = { code: 0, data: { message_id: "om_created" } };
   await assert.rejects(transport.createRelayTopic("oc_group", "缺失话题标识"), /可能已创建但未绑定/);
+});
+
+test("飞书传输：出站媒体先上传再按话题回复，缺标识必须报错", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "relay-media-transport-"));
+  const shot = join(dir, "shot.png");
+  writeFileSync(shot, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  // 只替换 sdkClient：上传与回复的请求体形状是本测试的断言对象。
+  type SdkCall = { data: Record<string, unknown>; path?: Record<string, unknown> };
+  const calls: SdkCall[] = [];
+  // 上传接口在 SDK 1.65 里直接把响应体返回（键在顶层），v1 的其它接口仍是 { code, data }：两种形状都要覆盖。
+  let response: unknown = { image_key: "img_key" };
+  const call = async (params: SdkCall) => { calls.push(params); return response; };
+  // 假 SDK 不会读完流，收尾必须自己关掉，否则临时目录先被删会得到 ENOENT
+  t.after(() => {
+    for (const entry of calls) {
+      const stream = entry.data.image ?? entry.data.file;
+      if (stream instanceof ReadStream) stream.destroy();
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const transport = new FeishuTransport(config, async () => {}, async () => {});
+  const sdkClient = { im: { v1: { image: { create: call }, file: { create: call } }, message: { reply: call } } };
+  // 测试替身：FeishuTransport 的 sdkClient 由 start() 从 lark SDK 构造，这里直接注入同形状的假客户端。
+  (transport as unknown as { sdkClient: unknown }).sdkClient = sdkClient;
+  assert.equal(await transport.uploadRelayMedia("image", shot, "shot.png"), "img_key");
+  const uploaded = calls.at(-1)!;
+  assert.equal(uploaded.data.image_type, "message", "图片必须按消息图片上传，否则飞书不给渲染");
+  assert.ok(uploaded.data.image instanceof ReadStream, "上传要传流，不能整文件读进内存");
+  // 有的 SDK 版本把上传响应包成 { code, data }：同样要取到 key，不能当失败
+  response = { code: 0, data: { image_key: "nested_key" } };
+  assert.equal(await transport.uploadRelayMedia("image", shot, "shot.png"), "nested_key");
+  response = { file_key: "file_key" };
+  assert.equal(await transport.uploadRelayMedia("file", shot, "报告.pdf"), "file_key");
+  const uploadedFile = calls.at(-1)!;
+  assert.equal(uploadedFile.data.file_type, "stream");
+  assert.equal(uploadedFile.data.file_name, "报告.pdf");
+  assert.ok(uploadedFile.data.file instanceof ReadStream);
+  response = { code: 0, data: { message_id: "om_media" } };
+  assert.equal(await transport.replyRelayMedia("om_root", "image", "img_key"), "om_media");
+  const imageReply = calls.at(-1)!;
+  assert.equal(imageReply.data.msg_type, "image");
+  assert.equal(imageReply.data.reply_in_thread, true);
+  assert.equal(imageReply.path?.message_id, "om_root");
+  assert.deepEqual(JSON.parse(String(imageReply.data.content)), { image_key: "img_key" });
+  await transport.replyRelayMedia("om_root", "file", "file_key");
+  const fileReply = calls.at(-1)!;
+  assert.equal(fileReply.data.msg_type, "file");
+  assert.deepEqual(JSON.parse(String(fileReply.data.content)), { file_key: "file_key" });
+  // 平台没返回标识或消息 id 时必须报错，不能让调用方以为发出去了
+  response = {};
+  await assert.rejects(transport.uploadRelayMedia("image", shot, "shot.png"), /未返回图片标识/);
+  await assert.rejects(transport.uploadRelayMedia("file", shot, "shot.png"), /未返回文件标识/);
+  response = { code: 0, data: {} };
+  await assert.rejects(transport.replyRelayMedia("om_root", "file", "file_key"), /未返回消息标识/);
 });
 
 test("飞书传输：接力在群聊触发过滤之前分派，异常不能回落后台", async (t) => {

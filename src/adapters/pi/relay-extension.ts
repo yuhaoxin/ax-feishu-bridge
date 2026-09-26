@@ -12,6 +12,7 @@ import {
 } from "../../feishu/ask-card.ts";
 import { RelayClient } from "./relay-client.ts";
 import { relayHelp } from "./feishu-help.ts";
+import { describeMediaFile, resolveMediaPath } from "../../feishu/media.ts";
 
 /**
  * omp 用独立的 session_switch 事件表达会话切换（pi 没有该事件，用 session_start 的
@@ -315,11 +316,15 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     answered = false;
   });
 
-  async function execute(action: string, params: { text?: string; enabled?: boolean; chatId?: string; ownerOpenId?: string }, context: ExtensionContext) {
+  async function execute(action: string, params: { text?: string; enabled?: boolean; chatId?: string; ownerOpenId?: string; path?: string }, context: ExtensionContext) {
     if (context.mode !== "tui" || !context.hasUI || !context.sessionManager.getSessionFile()) throw new Error("接力只能在 Pi TUI 会话中使用。");
     if (context.sessionManager.getSessionId() !== sessionId || !client) attach(context);
     const active = client!;
-    const result = await active.request(action, params);
+    // 相对路径按会话工作目录解析：网关是常驻进程，工作目录与终端不同，只有这里能算出用户要的路径。
+    const outgoing = action === "push_image" || action === "push_file"
+      ? { path: describeMediaFile(resolveMediaPath(String(params.path ?? ""), context.cwd), action === "push_image" ? "image" : "file").path }
+      : params;
+    const result = await active.request(action, outgoing);
     status();
     return result;
   }
@@ -327,11 +332,12 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
   pi.registerTool({
     name: "feishu_relay",
     label: "飞书会话接力",
-    description: "查询/管理当前 Pi TUI 会话的飞书接力：状态、解绑（永久退出自动绑定）、向绑定话题推送文本、开关新会话自动绑定。新会话在首条消息时自动建话题；不能指定任意接收者或修改授权账号。绑定会话每轮正式回复自动同步。",
+    description: "查询/管理当前 Pi TUI 会话的飞书接力：状态、解绑（永久退出自动绑定）、向绑定话题推送文本/图片/本地文件、开关新会话自动绑定。新会话在首条消息时自动建话题；不能指定任意接收者或修改授权账号。绑定会话每轮正式回复自动同步。",
     parameters: Type.Object({
-      action: Type.Union([Type.Literal("status"), Type.Literal("unbind"), Type.Literal("push"), Type.Literal("autobind")]),
+      action: Type.Union([Type.Literal("status"), Type.Literal("unbind"), Type.Literal("push"), Type.Literal("autobind"), Type.Literal("push_image"), Type.Literal("push_file")]),
       enabled: Type.Optional(Type.Boolean({ description: "action=autobind 时：true 开启新会话自动绑定，false 关闭" })),
       text: Type.Optional(Type.String({ description: "action=push 时推送的文本", maxLength: 100000 })),
+      path: Type.Optional(Type.String({ description: "action=push_image/push_file 时的本地文件路径，支持绝对路径、相对会话工作目录的路径与 ~/ 开头；图片 ≤10 MB，文件 ≤30 MB", maxLength: 4096 })),
     }),
     async execute(_id, params, _signal, _onUpdate, context) {
       const result = await execute(params.action, params, context);
@@ -445,8 +451,9 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
       const toggle = RELAY_TOGGLES[action];
       const result = await execute(toggle.method, { enabled: on === "on" }, context);
       context.ui.notify(`${toggle.label}已${result[toggle.field] ? "开启" : "关闭"}。`, "info");
-    } else if (["unbind", "status", "push"].includes(action)) {
-      const result = await execute(action, { text }, context);
+    } else if (["unbind", "status", "push", "push_image", "push_file"].includes(action)) {
+      const media = action === "push_image" || action === "push_file";
+      const result = await execute(action, media ? { path: text } : { text }, context);
       context.ui.notify(formatResult(action, result, client?.echo !== false), "info");
     } else if (action === "help") {
       context.ui.notify(relayHelp(), "info");
@@ -472,6 +479,8 @@ function formatResult(action: string, result: any, echo: boolean) {
   if (action === "autobind") return `新会话自动绑定：${result?.autobind ? "开启" : "关闭"}`;
   if (action === "echo") return `输入镜像：${result?.echo ? "开启" : "关闭"}`;
   if (action === "push") return "已推送到当前会话的话题。";
+  if (action === "push_image") return "图片已推送到当前会话的话题。";
+  if (action === "push_file") return "文件已推送到当前会话的话题。";
   // register/ping/status 返回 { binding, echo }，unbind 直接返回绑定本身。
   const binding = action === "status" ? result?.binding : result;
   if (!binding || binding.unbound) return "当前会话未绑定；已记录退出，新会话自动绑定不会再包含它。";

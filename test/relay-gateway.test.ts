@@ -15,6 +15,8 @@ export function fakeTransport() {
   const renames: Array<{ root: string; title: string }> = [];
   const text: Array<{ root: string; text: string }> = [];
   const cards: Array<{ root: string; card: any }> = [];
+  const uploads: Array<{ kind: string; path: string; name: string }> = [];
+  const media: Array<{ root: string; kind: string; key: string }> = [];
   const transport: RelayTransport = {
     async verifyTopicChat(chat, owner) { assert.equal(chat, "oc_test"); assert.equal(owner, "ou_owner"); },
     async createRelayTopic(_chat, title) {
@@ -23,10 +25,12 @@ export function fakeTransport() {
     },
     async replyRelayText(root, value) { text.push({ root, text: value }); },
     async replyRelayCard(root, card) { cards.push({ root, card }); return `om_card${cards.length}`; },
+    async uploadRelayMedia(kind, path, name) { uploads.push({ kind, path, name }); return `${kind}_key`; },
+    async replyRelayMedia(root, kind, key) { media.push({ root, kind, key }); return `om_media${media.length}`; },
     async updateRelayCard() {},
     async renameRelayTitle(root, title) { renames.push({ root, title }); },
   };
-  return { topics, renames, text, cards, transport };
+  return { topics, renames, text, cards, uploads, media, transport };
 }
 
 function incoming(threadId: string, messageId: string, senderOpenId = "ou_owner"): FeishuMessage {
@@ -160,6 +164,33 @@ test("接力：正式答案只发一次，长内容分块且保持同一话题",
   assert.equal(f.cards.length, count);
   await f.a.request("push", { text: "主动通知" });
   assert.equal(f.text.at(-1)!.text, "主动通知");
+});
+
+test("接力：出站媒体按本地校验上传后回到同一话题", async (t) => {
+  const f = await fixture(t);
+  const created = await f.a.request("autobindTopic", { title: "A", firstInput: "首条输入 A" });
+  const root = created.binding.rootMessageId;
+  const dir = mkdtempSync(join(tmpdir(), "relay-media-gateway-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const shot = join(dir, "shot.png");
+  writeFileSync(shot, Buffer.alloc(32, 3));
+  await f.a.request("push_image", { path: shot });
+  assert.deepEqual(f.uploads.at(-1), { kind: "image", path: shot, name: "shot.png" });
+  assert.deepEqual(f.media.at(-1), { root, kind: "image", key: "image_key" });
+  await f.a.request("push_file", { path: shot });
+  assert.deepEqual(f.uploads.at(-1), { kind: "file", path: shot, name: "shot.png" });
+  assert.deepEqual(f.media.at(-1), { root, kind: "file", key: "file_key" });
+  // 网关不信任终端传来的路径：不存在、类型不符或未绝对化的都在上传前拦掉
+  const before = f.uploads.length;
+  await assert.rejects(f.a.request("push_image", { path: join(dir, "missing.png") }), /文件不存在/);
+  await assert.rejects(f.a.request("push_file", { path: join(dir, "missing.png") }), /文件不存在/);
+  const note = join(dir, "note.txt");
+  writeFileSync(note, "hi");
+  await assert.rejects(f.a.request("push_image", { path: note }), /不是图片/);
+  await assert.rejects(f.a.request("push_file", { path: dir }), /不是普通文件/);
+  await assert.rejects(f.a.request("push_image", { path: "relative.png" }), /必须是绝对路径/);
+  await assert.rejects(f.a.request("push_image", {}), /需要非空文本/);
+  assert.equal(f.uploads.length, before, "校验失败不能产生上传");
 });
 
 test("接力：话题创建超时后持久阻断重试及普通后台回落", async (t) => {

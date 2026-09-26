@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import type { FeishuCardAction, FeishuConfig, FeishuMessage } from "./types.ts";
 import { loadConfig } from "./config.ts";
 import { debugLog } from "./debug.ts";
@@ -432,6 +433,47 @@ export class FeishuTransport {
     return String(data.message_id);
   }
 
+  /**
+   * 上传待发送的媒体，返回平台文件标识（图片 image_key / 文件 file_key）。
+   * 不重试：重放会重复占用平台存储，且本地文件校验已经在前一步完成。
+   */
+  async uploadRelayMedia(kind: "image" | "file", filePath: string, fileName: string): Promise<string> {
+    debugLog("feishu.relay.media.upload", { kind, filePath });
+    const stream = createReadStream(filePath);
+    // 失败路径上的 destroy() 可能让流在 open 完成前结束并抛出 ENOENT；没有监听器时 Node 会把
+    // 这个 error 事件当成未捕获异常，直接终止常驻网关。真正的失败原因由请求结果给出。
+    stream.on("error", () => {});
+    try {
+      const result = kind === "image"
+        ? await this.sdkClient.im.v1.image.create({ data: { image_type: "message", image: stream } })
+        : await this.sdkClient.im.v1.file.create({ data: { file_type: "stream", file_name: fileName, file: stream } });
+      const key = uploadKey(result, kind);
+      if (!key) throw new Error(`飞书未返回${kind === "image" ? "图片" : "文件"}标识，上传结果未确认；请检查飞书。`);
+      return key;
+    } catch (error) {
+      // 上传未走完时 SDK 不会读完流：不关掉会一直占着文件描述符，直到 GC 才释放。
+      stream.destroy();
+      throw error;
+    }
+  }
+
+  /** 媒体按普通话题回复投递，与文本、卡片共用同一话题。 */
+  async replyRelayMedia(rootMessageId: string, kind: "image" | "file", key: string): Promise<string> {
+    const result = await this.sdkClient.im.message.reply({
+      path: { message_id: rootMessageId },
+      data: {
+        msg_type: kind,
+        content: JSON.stringify(kind === "image" ? { image_key: key } : { file_key: key }),
+        reply_in_thread: true,
+        uuid: randomUUID(),
+      },
+    });
+    const data = this.relayResult(result);
+    if (!data.message_id) throw new Error("飞书未返回消息标识，投递结果未确认；请检查飞书。");
+    this.rememberBotOutboundMessageId(data.message_id);
+    return String(data.message_id);
+  }
+
   async updateRelayCard(messageId: string, card: object) {
     debugLog("feishu.relay.card.update", { messageId });
     await this.updateCard(messageId, card);
@@ -724,6 +766,22 @@ async function streamToBuffer(readable: NodeJS.ReadableStream): Promise<Buffer> 
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return Buffer.concat(chunks);
+}
+
+/**
+ * 上传接口的返回形状与 v1 的其它接口不同：SDK 1.65 把响应体直接当结果返回（image_key/file_key 在顶层），
+ * 也可能包一层 { code, data }。两种都接受；取不到标识时由调用方报错。
+ */
+function uploadKey(result: unknown, kind: "image" | "file"): string | undefined {
+  const field = kind === "image" ? "image_key" : "file_key";
+  const record = asRecord(result);
+  const nested = asRecord(record?.data);
+  const key = record?.[field] ?? nested?.[field];
+  return typeof key === "string" && key ? key : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
 function readableFromDownload(result: any): NodeJS.ReadableStream {

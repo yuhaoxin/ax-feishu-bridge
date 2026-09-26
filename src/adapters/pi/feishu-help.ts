@@ -24,6 +24,8 @@ export function feishuHelp(): string {
     "  /feishu relay exit-notice on|off    开关「退出 TUI 时推送对话关闭消息」（默认开）",
     "  /feishu relay status                查看当前会话的绑定状态和输入镜像开关",
     "  /feishu relay push <文本>           向当前会话的绑定话题主动推送一条消息",
+    "  /feishu relay push_image <路径>     向绑定话题推送一张本地图片（png/jpg/jpeg/gif/bmp/webp/ico/tif/tiff/heic，≤10 MB）",
+    "  /feishu relay push_file <路径>      向绑定话题推送一个本地文件（≤30 MB）",
     "  /feishu relay unbind                解绑当前会话并永久退出自动绑定（不删历史与话题）",
     "  /feishu relay help                  显示接力命令说明",
     "",
@@ -42,6 +44,8 @@ export function relayHelp(): string {
     "  /feishu relay exit-notice on|off    开关「退出 TUI 时向话题推送对话关闭消息」；默认开",
     "  /feishu relay status                查看当前会话绑定状态",
     "  /feishu relay push <文本>           向当前会话的绑定话题主动推送一条消息（最多 100000 字符）",
+    "  /feishu relay push_image <路径>     向绑定话题推送一张本地图片（≤10 MB；相对路径按会话工作目录解析）",
+    "  /feishu relay push_file <路径>      向绑定话题推送一个本地文件（≤30 MB；相对路径按会话工作目录解析）",
     "  /feishu relay unbind                解绑当前会话并永久退出自动绑定；旧话题继续拒绝执行"
   ].join("\n");
 }

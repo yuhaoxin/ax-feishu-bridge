@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -37,6 +37,8 @@ async function fixture(t: any) {
       signal?.addEventListener("abort", () => { entry.aborted = true; resolve(undefined); }, { once: true });
     });
   const renames: Array<{ root: string; title: string }> = [];
+  const uploads: Array<{ kind: string; path: string; name: string }> = [];
+  const media: Array<{ root: string; kind: string; key: string }> = [];
   const status = new Map<string, string>();
   let busy = false;
   let id = "session-one";
@@ -51,6 +53,8 @@ async function fixture(t: any) {
     async replyRelayText(_root, text) { attempts++; if (sendFailure) throw new Error(sendFailure); notices.push(text); journal.push(`text:${text}`); },
     async replyRelayCard(root, card) { attempts++; if (sendFailure) throw new Error(sendFailure); cards.push({ root, card }); journal.push(`card:${card.elements[0].content}`); return `card_${cards.length}`; },
     async updateRelayCard(messageId, card) { cardUpdates.push({ messageId, card }); },
+    async uploadRelayMedia(kind, path, name) { uploads.push({ kind, path, name }); return `${kind}_key`; },
+    async replyRelayMedia(root, kind, key) { media.push({ root, kind, key }); return `om_media${media.length}`; },
     async renameRelayTitle(root, title) { renames.push({ root, title }); },
   };
   const gateway = new RelayGateway(join(dir, "state.json"), join(dir, "endpoint.json"), "app", transport);
@@ -90,7 +94,7 @@ async function fixture(t: any) {
     chatId: "oc_test", chatType: "group", threadId, messageId, senderOpenId: "ou_owner", msgType: "text", content: JSON.stringify({ text: "来自飞书" }),
   });
   return {
-    emit, emitAsync, ctx, command, inputs, cards, cardUpdates, dialogs, gateway, renames, notices, incoming, handlers, tools, status, journal, outbound,
+    emit, emitAsync, ctx, command, inputs, cards, cardUpdates, dialogs, gateway, renames, notices, incoming, handlers, tools, status, journal, outbound, uploads, media,
     answerDialog: (value: string) => dialogs.filter((dialog) => !dialog.aborted).pop()?.resolve(value),
     attempts: () => attempts,
     setSendFailure: (value: string | undefined) => { sendFailure = value; },
@@ -212,6 +216,39 @@ test("接力扩展：autobind 开关与错误用法；配置入口不向模型�
   assert.deepEqual(f.journal, [], "没有话题就没有镜像去处");
   await assert.rejects(f.command("autobind", f.ctx), /relay/);
   await assert.rejects(f.command("push 内容", { ...f.ctx, hasUI: false }), /Pi TUI/);
+});
+
+test("接力扩展：feishu_relay 推送图片与文件，相对路径按会话工作目录解析", async (t) => {
+  const f = await fixture(t);
+  await f.emitAsync("input", { text: "开始", source: "interactive" });
+  await waitFor(() => f.outbound().length === 1);
+  const tool = f.tools.find((item) => item.name === "feishu_relay");
+  // 模型只看到这两个新动作和 path 参数；工具不接受收件人等配置
+  assert.match(JSON.stringify(tool.parameters), /push_image/);
+  assert.match(JSON.stringify(tool.parameters), /push_file/);
+  assert.match(JSON.stringify(tool.parameters), /"path"/);
+  const dir = mkdtempSync(join(tmpdir(), "relay-media-extension-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, "shot.png"), Buffer.alloc(8, 1));
+  f.ctx.cwd = dir;
+  const image = await tool.execute("call-image", { action: "push_image", path: "shot.png" }, undefined, undefined, f.ctx);
+  assert.match(image.content[0].text, /图片已推送到当前会话的话题/);
+  assert.deepEqual(f.uploads.at(-1), { kind: "image", path: join(dir, "shot.png"), name: "shot.png" });
+  assert.equal(f.media.at(-1).kind, "image");
+  await tool.execute("call-file", { action: "push_file", path: join(dir, "shot.png") }, undefined, undefined, f.ctx);
+  assert.deepEqual(f.uploads.at(-1), { kind: "file", path: join(dir, "shot.png"), name: "shot.png" });
+  // 本地能发现的错误在终端侧就报出，不依赖网关往返
+  await assert.rejects(tool.execute("call-missing", { action: "push_image", path: "missing.png" }, undefined, undefined, f.ctx), /文件不存在/);
+  await assert.rejects(tool.execute("call-nopath", { action: "push_file" }, undefined, undefined, f.ctx), /需要媒体文件路径/);
+  const uploads = f.uploads.length;
+  await assert.rejects(tool.execute("call-empty", { action: "push_image", path: "" }, undefined, undefined, f.ctx), /需要媒体文件路径/);
+  assert.equal(f.uploads.length, uploads, "校验失败不产生上传");
+  // 命令行入口与工具同一套解析，带空格的路径不被截断
+  const spaced = join(dir, "my shot.png");
+  writeFileSync(spaced, Buffer.alloc(4, 2));
+  await f.command("push_image my shot.png", f.ctx);
+  assert.deepEqual(f.uploads.at(-1), { kind: "image", path: spaced, name: "my shot.png" });
+  assert.ok(f.notices.some((text) => text.includes("图片已推送到当前会话的话题")));
 });
 
 test("接力扩展：每条正式答案都推送，整轮没有答案时说明一声", async (t) => {

@@ -18,7 +18,7 @@ import {
 import type { FeishuCardAction, FeishuMessage } from "../../feishu/types.ts";
 import { parseMessageInput } from "../../feishu/messages.ts";
 import { RelayPeer } from "./relay-rpc.ts";
-import { sendRelayAnswer, type RelayBinding, type RelayTransport } from "./relay-output.ts";
+import { sendRelayAnswer, sendRelayMedia, type RelayBinding, type RelayTransport } from "./relay-output.ts";
 
 export type RelayState = {
   version: 2;
@@ -317,6 +317,10 @@ export class RelayGateway {
     if (!binding?.enabled) throw new Error("当前会话没有启用的绑定话题。");
     if (method === "push") {
       await this.transport.replyRelayText(binding.rootMessageId, requireString(params?.text, 100_000));
+      return { delivered: true };
+    }
+    if (method === "push_image" || method === "push_file") {
+      await sendRelayMedia(this.transport, binding, method === "push_image" ? "image" : "file", requireString(params?.path, 4096));
       return { delivered: true };
     }
     throw new Error("未知的接力操作。");

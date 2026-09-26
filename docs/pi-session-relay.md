@@ -38,10 +38,14 @@ pi install git:github.com/yuhaoxin/ax-feishu-bridge@feat/feishu-session-handoff
 /feishu relay echo on|off
 /feishu relay exit-notice on|off
 /feishu relay push 指定通知内容
+/feishu relay push_image ~/Pictures/shot.png
+/feishu relay push_file ./dist/report.pdf
 /feishu relay unbind
 ```
 
-模型可调用 `feishu_relay` 工具的 `status`、`push`、`unbind`、`autobind` 操作。显式推送应由用户明确要求。工具没有任意收件人参数，仅操作当前会话，也不能改变群、授权账号、输入镜像或退出通知开关。
+模型可调用 `feishu_relay` 工具的 `status`、`push`、`push_image`、`push_file`、`unbind`、`autobind` 操作。显式推送应由用户明确要求。工具没有任意收件人参数，仅操作当前会话，也不能改变群、授权账号、输入镜像或退出通知开关。
+
+`push_image` 与 `push_file` 把本地文件上传到飞书后发进绑定话题：图片上限 10 MB，只接受 png/jpg/jpeg/gif/bmp/webp/ico/tif/tiff/heic；文件上限 30 MB，任意类型按 `stream` 上传，接收方下载后按文件类型打开。路径可以是绝对路径、相对会话工作目录的路径或 `~/` 开头；相对路径由终端进程解析，因为网关是常驻进程、工作目录与终端不同。终端和网关都会校验文件是否存在、是否普通文件、是否为空以及体积上限，校验失败不产生任何上传。上传与发送都不重试：平台确认失败即报错，避免重复占用存储或在话题里留下重复附件。
 
 本地输入镜像默认开启：你在终端里敲的每条输入都会以 `🖥 输入：` 前缀发到话题，与模型回复一起构成完整的对话记录；只有图片没有文字时用 `[图片 ×N]` 占位。`/feishu relay echo off` 关闭后话题只收正式回复，重新打开不补推关闭期间的输入。扩展命令（如 `/feishu relay ...`）由 Pi 在输入事件之前拦截，不会进入话题；`/skill:` 与模板会被镜像为输入原文。飞书发来的消息在飞书侧本来就可见，不会回显。
 
@@ -53,7 +57,7 @@ pi install git:github.com/yuhaoxin/ax-feishu-bridge@feat/feishu-session-handoff
 - 同一会话不能由两个 TUI 接力连接同时占用。已由普通飞书后台加载的会话不能接力注册；先在飞书切换到新会话并重启网关。
 - 接力管理的会话不能再从普通飞书 `/resume` 路径驱动后台模型，避免两处写入同一历史。
 - `unbind` = 本会话永久退出接力：解绑并记入退出名单，此后 `session_start` 不再自动绑定；旧话题继续拒绝执行。退出后想恢复只能删除会话重新打开（新会话 ID 会自动绑定）。`autobind off` 是全局开关，关闭后新会话都不建话题，已绑定的会话不受影响。
-- 接力话题目前只接收文本（含纯文本富文本消息），不下载图片、文件或展开引用附件。斜杠命令作为普通输入送入 Pi，不执行飞书的 `/resume` 等后台管理命令。
+- 接力话题目前只接收文本（含纯文本富文本消息），不下载图片、文件或展开引用附件；出站方向可用 `push_image`、`push_file`（或对应的 `/feishu relay` 命令）发送图片和文件。斜杠命令作为普通输入送入 Pi，不执行飞书的 `/resume` 等后台管理命令。
 - 普通、未绑定的飞书会话保持原有后台聊天行为；本功能的单账号限制只保护接力话题，不改变其他会话的访问策略。
 
 ## omp 差异
