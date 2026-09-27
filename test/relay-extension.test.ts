@@ -36,6 +36,15 @@ async function fixture(t: any) {
       dialogs.push(entry);
       signal?.addEventListener("abort", () => { entry.aborted = true; resolve(undefined); }, { once: true });
     });
+  /** omp 专有的富对话框：记录收到的题目，由测试用 resolve 交出结构化答案。 */
+  const askDialogs: Array<{ questions: any[]; aborted: boolean; resolve: (value: any) => void }> = [];
+  const openAskDialog = (questions: any[], signal?: AbortSignal) =>
+    new Promise<any>((resolve) => {
+      const entry = { questions, aborted: false, resolve };
+      askDialogs.push(entry);
+      signal?.addEventListener("abort", () => { entry.aborted = true; resolve(undefined); }, { once: true });
+    });
+  let askDialogAvailable = false;
   const renames: Array<{ root: string; title: string }> = [];
   const uploads: Array<{ kind: string; path: string; name: string }> = [];
   const media: Array<{ root: string; kind: string; key: string }> = [];
@@ -71,10 +80,12 @@ async function fixture(t: any) {
       { name: "template", source: "prompt" },
     ],
   };
+  let aborted = false;
   const ctx: any = {
     mode: "tui",
     hasUI: true,
     cwd,
+    abort: () => { aborted = true; },
     sessionManager: { getSessionId: () => id, getSessionFile: () => "/not-read/session.jsonl", getSessionName: () => sessionName },
     isIdle: () => !busy,
     ui: {
@@ -82,6 +93,9 @@ async function fixture(t: any) {
       setStatus: (key: string, text: string) => status.set(key, text),
       select: (title: string, options: string[], opts?: { signal?: AbortSignal }) => openDialog("select", title, options, opts?.signal),
       input: (title: string, _placeholder?: string, opts?: { signal?: AbortSignal }) => openDialog("input", title, [], opts?.signal),
+      get askDialog() {
+        return askDialogAvailable ? (questions: any[], opts?: { signal?: AbortSignal }) => openAskDialog(questions, opts?.signal) : undefined;
+      },
     },
   };
   const command = registerRelayExtension(pi, join(dir, "endpoint.json"));
@@ -96,6 +110,10 @@ async function fixture(t: any) {
   return {
     emit, emitAsync, ctx, command, inputs, cards, cardUpdates, dialogs, gateway, renames, notices, incoming, handlers, tools, status, journal, outbound, uploads, media,
     answerDialog: (value: string) => dialogs.filter((dialog) => !dialog.aborted).pop()?.resolve(value),
+    askDialogs,
+    answerAskDialog: (value: any) => askDialogs.filter((dialog) => !dialog.aborted).pop()?.resolve(value),
+    useAskDialog: () => { askDialogAvailable = true; },
+    isAborted: () => aborted,
     attempts: () => attempts,
     setSendFailure: (value: string | undefined) => { sendFailure = value; },
     topicCount: () => topic,
@@ -504,6 +522,71 @@ test("接力 ask：飞书作答胜出并收起终端对话框", async (t) => {
   const result = await run;
   assert.match(result.content[0].text, /A/, "飞书选择要回到工具结果里");
   await waitFor(() => f.dialogs[0].aborted);
+});
+
+test("接力 ask：宿主有富对话框时整轮交给它，多题答案按 id 回填", async (t) => {
+  const f = await fixture(t);
+  f.useAskDialog();
+  await f.emitAsync("input", { text: "首条输入", source: "interactive" });
+  await waitFor(() => f.topicCount() === 1);
+  const ask = f.tools.find((tool) => tool.name === "ask");
+  const run = ask.execute("call-4", {
+    questions: [
+      { id: "q1", question: "长问题会不会被截断？", header: "范围", options: [{ label: "A" }, { label: "B" }], recommended: 1 },
+      { id: "q2", question: "还有别的吗？", options: [{ label: "C" }], multi: true },
+    ],
+  }, undefined, undefined, f.ctx);
+  await waitFor(() => f.askDialogs.length === 1);
+  assert.equal(f.dialogs.length, 0, "有富对话框时不该再开选择器");
+  const asked = f.askDialogs[0].questions;
+  assert.deepEqual(asked.map((question) => question.id), ["q1", "q2"], "整轮题目要一次交给富对话框");
+  assert.equal(asked[0].header, "范围");
+  assert.equal(asked[0].recommended, 1);
+  assert.equal(asked[1].multi, true);
+  f.answerAskDialog({
+    kind: "submit",
+    results: [
+      { id: "q1", selectedOptions: ["B"], note: "第一题备注" },
+      { id: "q2", selectedOptions: [], customInput: "自定义答案" },
+    ],
+  });
+  const result = await run;
+  const details = result.details as any;
+  assert.deepEqual(details.results[0].selectedOptions, ["B"]);
+  assert.equal(details.results[0].note, "第一题备注");
+  assert.equal(details.results[1].customInput, "自定义答案");
+  assert.match(result.content[0].text, /q1: B/);
+  assert.match(result.content[0].text, /q2: 自定义答案/);
+});
+
+test("接力 ask：未绑定时富对话框被 Esc 关掉按本轮未作答处理", async (t) => {
+  const f = await fixture(t);
+  f.useAskDialog();
+  const ask = f.tools.find((tool) => tool.name === "ask");
+  const run = ask.execute("call-5", { questions: [{ id: "q1", question: "选哪个？", options: [{ label: "A" }] }] }, undefined, undefined, f.ctx);
+  await waitFor(() => f.askDialogs.length === 1);
+  assert.equal(f.dialogs.length, 0, "有富对话框时不该再开选择器");
+  f.answerAskDialog(undefined);
+  await assert.rejects(run, /取消/, "取消要中止本轮，而不是当成空答案回给模型");
+  assert.equal(f.isAborted(), true, "取消要中止本轮操作");
+  assert.equal(f.cards.length, 0, "未绑定不发飞书卡片");
+});
+
+test("接力 ask：飞书作答胜出时收起富对话框", async (t) => {
+  const f = await fixture(t);
+  f.useAskDialog();
+  await f.emitAsync("input", { text: "首条输入", source: "interactive" });
+  await waitFor(() => f.topicCount() === 1);
+  const ask = f.tools.find((tool) => tool.name === "ask");
+  const run = ask.execute("call-6", { questions: [{ id: "q1", question: "选哪个？", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, f.ctx);
+  await waitFor(() => f.cards.length === 1 && f.askDialogs.length === 1);
+  await f.gateway.handleAskAction({
+    messageId: "card_1", chatId: "oc_test", operatorOpenId: "ou_owner",
+    value: { action: ASK_ACTION, runId: cardRunId(f.cards[0].card), questionId: "q1", kind: "option", label: "B" },
+  });
+  const result = await run;
+  assert.match(result.content[0].text, /B/);
+  await waitFor(() => f.askDialogs[0].aborted);
 });
 
 test("接力 ask：未绑定时只走终端对话框，不发飞书卡片", async (t) => {

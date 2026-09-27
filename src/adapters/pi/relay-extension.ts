@@ -7,6 +7,7 @@ import {
   formatAskDetails,
   formatAskText,
   type AskAnswer,
+  type AskOption,
   type AskQuestion,
   type AskResult,
 } from "../../feishu/ask-card.ts";
@@ -545,8 +546,79 @@ function raceFirst(candidates: Array<Promise<ChannelResult | undefined>>): Promi
   });
 }
 
-/** 终端侧对话框：复刻原生 ask 的选择器回退（单选 + Other、多选勾选循环）。 */
+/**
+ * 宿主（omp）提供的富问答对话框：问题按可用宽度换行展示，多题分页，支持备注与预览。
+ * pi 宿主的 UI 类型里没有该方法，按运行时形状探测，拿不到就退回本扩展的选择器实现。
+ */
+type HostAskDialog = (
+  questions: Array<{
+    id: string;
+    question: string;
+    header?: string;
+    options: AskOption[];
+    multi?: boolean;
+    recommended?: number;
+  }>,
+  options?: { signal?: AbortSignal },
+) => Promise<
+  | { kind: "submit"; results: Array<{ id: string; selectedOptions: string[]; customInput?: string; note?: string }> }
+  | { kind: "chat" }
+  | undefined
+>;
+
+function hostAskDialog(context: ExtensionContext): HostAskDialog | undefined {
+  const candidate = (context.ui as { askDialog?: unknown }).askDialog;
+  return typeof candidate === "function" ? (candidate as HostAskDialog) : undefined;
+}
+
+/** 终端侧对话框：有宿主富对话框就用它（长问题换行展示），否则回退到选择器。 */
 async function runTuiChannel(context: ExtensionContext, questions: AskQuestion[], signal: AbortSignal): Promise<ChannelResult | undefined> {
+  const askDialog = hostAskDialog(context);
+  const results = askDialog
+    ? await askInHostDialog(askDialog, context, questions, signal)
+    : await runSelectorChannel(context, questions, signal);
+  return results ? { source: "tui", results } : undefined;
+}
+
+/** 富对话框一次收下全部题目；答案按题目下标与 id 对齐，取消或对不上都按「本轮未作答」处理。 */
+async function askInHostDialog(
+  askDialog: HostAskDialog,
+  context: ExtensionContext,
+  questions: AskQuestion[],
+  signal: AbortSignal,
+): Promise<AskResult[] | undefined> {
+  const reply = await askDialog.call(
+    context.ui,
+    questions.map((question) => ({
+      id: question.id,
+      question: question.question,
+      ...(question.header ? { header: question.header } : {}),
+      options: question.options,
+      ...(question.multi === undefined ? {} : { multi: question.multi }),
+      ...(question.recommended === undefined ? {} : { recommended: question.recommended }),
+    })),
+    { signal },
+  );
+  if (!reply || reply.kind !== "submit" || reply.results.length !== questions.length) return undefined;
+  const results: AskResult[] = [];
+  for (let index = 0; index < questions.length; index++) {
+    const question = questions[index];
+    const item = reply.results[index];
+    if (item.id !== question.id) return undefined;
+    results.push({
+      question,
+      answer: {
+        selectedOptions: [...item.selectedOptions],
+        ...(item.customInput === undefined ? {} : { customInput: item.customInput }),
+        ...(item.note === undefined ? {} : { note: item.note }),
+      },
+    });
+  }
+  return results;
+}
+
+/** 无宿主富对话框时的回退：复刻原生 ask 的选择器实现（单选 + Other、多选勾选循环）。 */
+async function runSelectorChannel(context: ExtensionContext, questions: AskQuestion[], signal: AbortSignal): Promise<AskResult[] | undefined> {
   const results: AskResult[] = [];
   for (const question of questions) {
     if (signal.aborted) return undefined;
@@ -554,7 +626,7 @@ async function runTuiChannel(context: ExtensionContext, questions: AskQuestion[]
     if (!answer) return undefined;
     results.push({ question, answer });
   }
-  return { source: "tui", results };
+  return results;
 }
 
 async function askOnce(context: ExtensionContext, question: AskQuestion, signal: AbortSignal): Promise<AskAnswer | undefined> {
