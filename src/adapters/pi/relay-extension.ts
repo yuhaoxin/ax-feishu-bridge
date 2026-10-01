@@ -13,6 +13,7 @@ import {
 } from "../../feishu/ask-card.ts";
 import { RelayClient } from "./relay-client.ts";
 import { relayHelp } from "./feishu-help.ts";
+import { debugLog } from "../../feishu/debug.ts";
 import { describeMediaFile, resolveMediaPath } from "../../feishu/media.ts";
 
 /**
@@ -121,15 +122,24 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
   let outbox: Promise<void> = Promise.resolve();
   let outEpoch = 0;
   let sendFailures = 0;
+  /** 上一次自动建话题失败的原因：同因不重复弹窗，避免连续输入时反复提示。 */
+  let autobindFailure: string | undefined;
 
   function notify(error: unknown) {
     ctx?.ui.notify(error instanceof Error ? error.message : String(error), "warning");
   }
 
   function status() {
-    ctx?.ui.setStatus("feishu-relay", client?.connected
-      ? client.binding?.enabled ? `飞书接力：${client.binding.title}` : "飞书接力：未绑定"
-      : "飞书接力：离线");
+    if (!client?.connected) {
+      ctx?.ui.setStatus("feishu-relay", client ? "飞书接力：离线" : undefined);
+      return;
+    }
+    if (client.binding?.enabled) {
+      ctx?.ui.setStatus("feishu-relay", `飞书接力：${client.binding.title}`);
+      return;
+    }
+    // 未绑定时带一句原因：网关在自动对账、已退出接力、自动绑定关闭，看到的都不是同一件事。
+    ctx?.ui.setStatus("feishu-relay", client.pendingTopic ? "飞书接力：话题创建待对账" : "飞书接力：未绑定");
   }
 
   /**
@@ -262,9 +272,22 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
         // 阻塞首条消息直到绑定完成，避免第一轮回答赶不上话题建立而漏发。
         const title = relayTitle(ctx.sessionManager.getSessionName(), event.text, ctx.cwd);
         const result = await active.request("autobindTopic", { title, firstInput: storedInput(event.text) });
+        autobindFailure = undefined;
         if (result?.created) status();
-      } catch {
-        // 网关未运行/未配置/创建失败：静默跳过，不打断用户输入；状态栏已是离线。
+      } catch (error) {
+        // 建话题失败不能只体现在状态栏：记日志，并在原因变化时提示一次，避免出现"莫名未绑定"。
+        const reason = error instanceof Error ? error.message : String(error);
+        debugLog("feishu.relay.autobind_failed", { reason, connected: active.connected, sessionId });
+        // 刷新一次视图：状态栏要区分"待对账"与"未绑定"，这依赖网关的最新状态，不能等下一次心跳。
+        await active.request("status").catch(() => undefined);
+        // 网关没起来时不弹窗（状态栏已是离线）；网关在线却建不出话题才提示。
+        if (active.connected && reason !== autobindFailure) {
+          autobindFailure = reason;
+          notify(error);
+        }
+      } finally {
+        // 对账可能改变了未绑定的原因（待对账 / 未绑定），状态栏要跟上。
+        status();
       }
     }
     const bound = client;
@@ -342,7 +365,7 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     }),
     async execute(_id, params, _signal, _onUpdate, context) {
       const result = await execute(params.action, params, context);
-      return { content: [{ type: "text", text: formatResult(params.action, result, client?.echo !== false) }], details: result || {} };
+      return { content: [{ type: "text", text: formatResult(params.action, result, client) }], details: result || {} };
     },
   });
 
@@ -455,7 +478,7 @@ export function registerRelayExtension(pi: ExtensionAPI, endpointPath: string) {
     } else if (["unbind", "status", "push", "push_image", "push_file"].includes(action)) {
       const media = action === "push_image" || action === "push_file";
       const result = await execute(action, media ? { path: text } : { text }, context);
-      context.ui.notify(formatResult(action, result, client?.echo !== false), "info");
+      context.ui.notify(formatResult(action, result, client), "info");
     } else if (action === "help") {
       context.ui.notify(relayHelp(), "info");
     } else throw new Error(relayHelp());
@@ -476,18 +499,50 @@ function formalReplyText(content: Array<{ type: string; text?: string; textSigna
   return parts.filter((part) => hasFinal ? part.phase === "final_answer" : part.phase !== "commentary").map((part) => part.text).join("");
 }
 
-function formatResult(action: string, result: any, echo: boolean) {
+/** 绑定信息的读取视图：unbind 返回绑定本身，其余操作把绑定放在 binding 字段里。 */
+type RelayBindingView = { title?: string; threadId?: string; enabled?: boolean; unbound?: boolean };
+
+/** 网关状态视图与接力操作返回值的公共形状：只声明终端要读的字段。 */
+type RelayStatusView = {
+  binding?: RelayBindingView;
+  echo?: boolean;
+  autobind?: boolean;
+  optedOut?: boolean;
+  pendingTopic?: { title: string; mine?: boolean };
+};
+
+/** 操作返回值：可能是状态视图，也可能直接就是一条绑定。 */
+type RelayResultView = RelayStatusView & RelayBindingView;
+
+/**
+ * 未绑定的原因。三种情况在状态文件里长得很像，混成一句"未绑定"会让用户以为是掉线：
+ * 创建待对账、用户已主动退出、全局自动绑定关闭。
+ */
+function unboundReason(view: RelayStatusView | undefined) {
+  const pending = view?.pendingTopic;
+  if (pending) {
+    return pending.mine
+      ? `本会话的话题创建结果待对账（${pending.title}），网关会自动核对，无需手改状态文件`
+      : `另一个会话的话题创建结果待对账（${pending.title}），网关自动核对后再建本会话的话题`;
+  }
+  if (view?.optedOut) return "已永久退出接力，新会话的自动绑定不受影响";
+  if (view?.autobind === false) return "新会话自动绑定已关闭";
+  return "下一条输入会自动创建话题";
+}
+
+function formatResult(action: string, result: RelayResultView | undefined, view: RelayStatusView | undefined) {
   if (action === "autobind") return `新会话自动绑定：${result?.autobind ? "开启" : "关闭"}`;
   if (action === "echo") return `输入镜像：${result?.echo ? "开启" : "关闭"}`;
   if (action === "push") return "已推送到当前会话的话题。";
   if (action === "push_image") return "图片已推送到当前会话的话题。";
   if (action === "push_file") return "文件已推送到当前会话的话题。";
-  // register/ping/status 返回 { binding, echo }，unbind 直接返回绑定本身。
-  const binding = action === "status" ? result?.binding : result;
-  if (!binding || binding.unbound) return "当前会话未绑定；已记录退出，新会话自动绑定不会再包含它。";
+  // register/ping/status 返回 { binding, echo, … }，unbind 直接返回绑定本身；原因优先取本次状态返回，否则用最近一次刷新。
+  const binding: RelayBindingView | undefined = action === "status" ? result?.binding : result?.binding ?? result;
+  const reason = action === "status" ? result : view;
+  if (!binding || binding.unbound) return `当前会话未绑定：${unboundReason(reason)}。`;
   if (!binding.enabled) return `已解绑并永久退出接力：${binding.title}`;
   const bound = `已绑定：${binding.title}\n话题：${binding.threadId}`;
-  return action === "status" ? `${bound}\n输入镜像：${echo ? "开启" : "关闭"}` : bound;
+  return action === "status" ? `${bound}\n输入镜像：${reason?.echo !== false ? "开启" : "关闭"}` : bound;
 }
 
 type ChannelResult = { source: "feishu" | "tui"; results: AskResult[] };

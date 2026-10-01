@@ -12,6 +12,12 @@ export class RelayClient {
   echo = true;
   /** 退出时的对话关闭提示开关（网关全局设置，缺省为开）；随 register/ping/status/exitNotice 刷新。 */
   exitNotice = true;
+  /** 新会话自动绑定开关（网关全局设置，缺省为开）；随 register/ping/status 刷新。 */
+  autobind = true;
+  /** 当前会话是否已永久退出接力（不再自动绑定）。 */
+  optedOut = false;
+  /** 网关正在对账的话题创建意图：未绑定时用它区分"下次输入会建话题"与"创建卡在对账中"。 */
+  pendingTopic?: { title: string; mine: boolean };
   constructor(
     private readonly endpointPath: string,
     private readonly sessionId: string,
@@ -76,6 +82,9 @@ export class RelayClient {
     this.binding = view?.binding;
     this.echo = view?.echo !== false;
     this.exitNotice = view?.exitNotice !== false;
+    this.autobind = view?.autobind !== false;
+    this.optedOut = view?.optedOut === true;
+    this.pendingTopic = view?.pendingTopic;
   }
 
   /** 输出只能走现有连接，不允许断线后自动重发。 */

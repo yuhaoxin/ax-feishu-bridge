@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { RelayGateway } from "../src/adapters/pi/relay-gateway.ts";
+import { RelayTopicCreateError } from "../src/feishu/relay-topic.ts";
 import { registerRelayExtension, relayTitle } from "../src/adapters/pi/relay-extension.ts";
 import { ASK_ACTION } from "../src/feishu/ask-card.ts";
 import type { RelayTransport } from "../src/adapters/pi/relay-output.ts";
@@ -54,11 +55,13 @@ async function fixture(t: any) {
   let sessionName: string | undefined;
   let cwd = "/ws/demo-project";
   let topic = 0;
+  let topicFailure: Error | undefined;
   let sendFailure: string | undefined;
   let attempts = 0;
   const transport: RelayTransport = {
     async verifyTopicChat() {},
-    async createRelayTopic() { topic++; return { threadId: `omt_${topic}`, rootMessageId: `om_${topic}` }; },
+    async createRelayTopic() { if (topicFailure) throw topicFailure; topic++; return { threadId: `omt_${topic}`, rootMessageId: `om_${topic}` }; },
+    async findRelayTopicRoot() { return { complete: true }; },
     async replyRelayText(_root, text) { attempts++; if (sendFailure) throw new Error(sendFailure); notices.push(text); journal.push(`text:${text}`); },
     async replyRelayCard(root, card) { attempts++; if (sendFailure) throw new Error(sendFailure); cards.push({ root, card }); journal.push(`card:${card.elements[0].content}`); return `card_${cards.length}`; },
     async updateRelayCard(messageId, card) { cardUpdates.push({ messageId, card }); },
@@ -116,6 +119,7 @@ async function fixture(t: any) {
     isAborted: () => aborted,
     attempts: () => attempts,
     setSendFailure: (value: string | undefined) => { sendFailure = value; },
+    setTopicFailure: (value: Error | undefined) => { topicFailure = value; },
     topicCount: () => topic,
     setBusy: (value: boolean) => { busy = value; },
     setSessionName: (value: string | undefined) => { sessionName = value; },
@@ -234,6 +238,42 @@ test("接力扩展：autobind 开关与错误用法；配置入口不向模型�
   assert.deepEqual(f.journal, [], "没有话题就没有镜像去处");
   await assert.rejects(f.command("autobind", f.ctx), /relay/);
   await assert.rejects(f.command("push 内容", { ...f.ctx, hasUI: false }), /Pi TUI/);
+});
+
+test("接力扩展：建话题失败时说清原因，而不是只显示未绑定", async (t) => {
+  const f = await fixture(t);
+  const tool = f.tools.find((item) => item.name === "feishu_relay");
+  f.setTopicFailure(new RelayTopicCreateError("远端创建结果未确认", { certainNotCreated: false }));
+  await f.emitAsync("input", { text: "断网时的输入", source: "interactive" });
+  // 结果不确定：状态栏必须显示待对账，工具查询也要说清是哪种未绑定
+  await waitFor(() => (f.status.get("feishu-relay") ?? "").includes("待对账"));
+  assert.ok(f.notices.some((text) => text.includes("未确认")), "网关在线却建不出话题必须提示");
+  const status = await tool.execute("call-status", { action: "status" }, undefined, undefined, f.ctx);
+  assert.match(status.content[0].text, /待对账/);
+  assert.doesNotMatch(status.content[0].text, /已记录退出/, "没退出过就不能说成已退出");
+  // 连续性失败的同一条原因只提示一次：状态栏与日志已足够，不能淹掉终端
+  const before = f.notices.length;
+  await f.emitAsync("input", { text: "再试一次", source: "interactive" });
+  await f.emitAsync("input", { text: "第三次", source: "interactive" });
+  await waitFor(() => (f.status.get("feishu-relay") ?? "").includes("待对账"));
+  assert.equal(f.notices.length, before + 1, "对账开始的提示只弹一次");
+
+  // 主动退出的会话：状态查询说的是永久退出，不是"下一条输入会建话题"
+  const g = await fixture(t);
+  const gTool = g.tools.find((item) => item.name === "feishu_relay");
+  await g.emitAsync("input", { text: "第一轮", source: "interactive" });
+  await waitFor(() => g.topicCount() === 1);
+  await gTool.execute("call-unbind", { action: "unbind" }, undefined, undefined, g.ctx);
+  const unbound = await gTool.execute("call-status", { action: "status" }, undefined, undefined, g.ctx);
+  assert.match(unbound.content[0].text, /永久退出接力/);
+
+  // 自动绑定关闭：说明是开关而不是故障
+  const h = await fixture(t);
+  const hTool = h.tools.find((item) => item.name === "feishu_relay");
+  await h.command("autobind off", h.ctx);
+  await h.emitAsync("input", { text: "关闭开关的输入", source: "interactive" });
+  const off = await hTool.execute("call-status", { action: "status" }, undefined, undefined, h.ctx);
+  assert.match(off.content[0].text, /自动绑定已关闭/);
 });
 
 test("接力扩展：feishu_relay 推送图片与文件，相对路径按会话工作目录解析", async (t) => {
