@@ -43,6 +43,7 @@ test("接力端到端：飞书输入写入真实 Pi 会话并触发回答，订�
   const gateway = new RelayGateway(join(dir, "relay.json"), endpoint, "app", {
     async verifyTopicChat() {},
     async createRelayTopic() { return { threadId: "omt_test", rootMessageId: "om_root" }; },
+    async findRelayTopicRoot() { return { complete: true }; },
     async replyRelayText(_root, text) { sent.push(`text:${text}`); },
     async replyRelayCard(_root, card) { sent.push(`card:${card.elements[0].content}`); cards.push(card); return "om_reply"; },
   });

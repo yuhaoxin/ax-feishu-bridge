@@ -18,6 +18,7 @@ function fakeTransport() {
   const transport: RelayTransport = {
     async verifyTopicChat(chat, owner) { assert.equal(chat, "oc_test"); assert.equal(owner, "ou_owner"); },
     async createRelayTopic(_chat, title) { return { threadId: "omt_1", rootMessageId: "om_1" }; },
+    async findRelayTopicRoot() { return { complete: true }; },
     async replyRelayText(root, value) { text.push({ root, text: value }); },
     async replyRelayCard(root, card) { cards.push({ root, card }); return `om_card${cards.length}`; },
     async updateRelayCard(messageId, card) { cardUpdates.push({ messageId, card }); },

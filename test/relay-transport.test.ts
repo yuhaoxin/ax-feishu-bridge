@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { FeishuTransport } from "../src/feishu/transport.ts";
+import { RelayTopicCreateError, isPreSendFailure } from "../src/feishu/relay-topic.ts";
 import { getRuntimeSource, setRuntimeSource } from "../src/feishu/config.ts";
 
 const config: any = { appId: "app", appSecret: "unused-test-secret", domain: "feishu", groupPolicy: "mention", autoStart: false };
@@ -13,11 +14,15 @@ test("飞书传输：创建话题验证群主，出站指定 thread 且校验业
   const calls: any[] = [];
   let response: any = { code: 0, data: { message_id: "om_root", thread_id: "omt_topic", group_message_type: "thread", owner_id: "ou_owner" } };
   const call = async (params: any) => { calls.push(params); return response; };
-  (transport as any).sdkClient = { im: { v1: { chat: { get: call }, message: { patch: call } }, message: { create: call, reply: call } } };
+  const getCalls: any[] = [];
+  const get = async (params: any) => { getCalls.push(params); return { code: 0, data: { items: [{ message_id: "om_created", thread_id: "omt_fetched" }] } }; };
+  (transport as any).sdkClient = { im: { v1: { chat: { get: call }, message: { patch: call } }, message: { create: call, reply: call, get } } };
   await transport.verifyTopicChat("oc_group", "ou_owner");
   await assert.rejects(transport.verifyTopicChat("oc_group", "ou_stranger"), /群主/);
-  const topic = await transport.createRelayTopic("oc_group", "标题");
+  const topic = await transport.createRelayTopic("oc_group", "标题", "uuid-1");
   assert.deepEqual(topic, { threadId: "omt_topic", rootMessageId: "om_root" });
+  // 幂等键必须透传：调用方靠同一个 uuid 重放才能拿回原话题而不是又建一个
+  assert.equal(calls.at(-1).data.uuid, "uuid-1");
   // 根消息正文就是话题标题的展示，同时说明本话题会收到什么
   assert.equal(JSON.parse(calls.at(-1).data.content).text, "标题\n本话题接收本机终端输入与每轮正式回复。");
   await transport.replyRelayCard(topic.rootMessageId, { elements: [] });
@@ -32,10 +37,84 @@ test("飞书传输：创建话题验证群主，出站指定 thread 且校验业
   assert.equal(calls.at(-1).data.reply_in_thread, true);
   response = { code: 999, msg: "internal details" };
   const count = calls.length;
-  await assert.rejects(transport.createRelayTopic("oc_group", "失败"), /错误码 999/);
+  await assert.rejects(transport.createRelayTopic("oc_group", "失败", "uuid-2"), /错误码 999/);
   assert.equal(calls.length, count + 1, "不能自动重试创建话题");
+  // 业务码非 0 是服务端明确拒绝：消息没有创建，调用方可以随后正常重建
+  await assert.rejects(transport.createRelayTopic("oc_group", "失败", "uuid-3"), (error: unknown) => {
+    assert.ok(error instanceof RelayTopicCreateError);
+    assert.equal(error.certainNotCreated, true);
+    return true;
+  });
+  // 消息已创建但响应缺话题标识：补查单条消息救回 thread_id，不能要求人工处理
   response = { code: 0, data: { message_id: "om_created" } };
-  await assert.rejects(transport.createRelayTopic("oc_group", "缺失话题标识"), /可能已创建但未绑定/);
+  assert.deepEqual(await transport.createRelayTopic("oc_group", "缺标识", "uuid-4"), { threadId: "omt_fetched", rootMessageId: "om_created" });
+  assert.equal(getCalls.at(-1).path.message_id, "om_created");
+  // 补查也拿不到话题标识时才报"已创建但未绑定"，且必须按不确定处理
+  delete (transport as any).sdkClient.im.message.get;
+  await assert.rejects(transport.createRelayTopic("oc_group", "缺标识", "uuid-5"), (error: unknown) => {
+    assert.ok(error instanceof RelayTopicCreateError);
+    assert.equal(error.certainNotCreated, false);
+    assert.match(error.message, /话题已创建但未绑定/);
+    return true;
+  });
+});
+
+test("飞书传输：只有确定没送出去的失败才允许当作未创建", async () => {
+  // DNS 解析失败、连接被拒、TLS 握手失败都发生在请求送达之前
+  assert.equal(isPreSendFailure(Object.assign(new Error("dns"), { code: "ENOTFOUND" })), true);
+  assert.equal(isPreSendFailure(Object.assign(new Error("tls"), { code: "SELF_SIGNED_CERT_IN_CHAIN" })), true);
+  // 错误码可能包在 cause 链里：各层包装都必须能判出来
+  assert.equal(isPreSendFailure(new Error("fetch failed", { cause: Object.assign(new Error("dns"), { code: "EAI_AGAIN" }) })), true);
+  // 超时、连接重置、5xx 都可能已经执行，必须按不确定处理
+  assert.equal(isPreSendFailure(Object.assign(new Error("timeout"), { code: "ETIMEDOUT" })), false);
+  assert.equal(isPreSendFailure(Object.assign(new Error("reset"), { code: "ECONNRESET" })), false);
+  assert.equal(isPreSendFailure(new Error("boom")), false);
+  assert.equal(isPreSendFailure(undefined), false);
+
+  const transport = new FeishuTransport(config, async () => {}, async () => {});
+  (transport as any).sdkClient = { im: { message: { create: async () => { throw Object.assign(new Error("getaddrinfo ENOTFOUND open.feishu.cn"), { code: "ENOTFOUND" }); } } } };
+  await assert.rejects(transport.createRelayTopic("oc_group", "断网", "uuid-a"), (error: unknown) => {
+    assert.ok(error instanceof RelayTopicCreateError);
+    assert.equal(error.certainNotCreated, true);
+    return true;
+  });
+  (transport as any).sdkClient = { im: { message: { create: async () => { throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }); } } } };
+  await assert.rejects(transport.createRelayTopic("oc_group", "断链", "uuid-b"), (error: unknown) => {
+    assert.ok(error instanceof RelayTopicCreateError);
+    assert.equal(error.certainNotCreated, false);
+    return true;
+  });
+});
+
+test("飞书传输：按时间窗口在群历史里认领接力话题根消息", async () => {
+  const transport = new FeishuTransport(config, async () => {}, async () => {});
+  const title = "项目:首条输入 [01a0eada]";
+  const rootText = JSON.stringify({ text: `${title}\n本话题接收本机终端输入与每轮正式回复。` });
+  const pages: any[] = [
+    { code: 0, data: { items: [
+      // 回复同样带 thread_id：不能当成话题根
+      { message_id: "om_reply", thread_id: "omt_x", root_id: "om_other", parent_id: "om_other", body: { content: JSON.stringify({ text: title }) } },
+      // 标题只差一个字符：不能命中（标题里带会话短 ID，正是为了区分）
+      { message_id: "om_other", thread_id: "omt_y", body: { content: JSON.stringify({ text: "项目:首条输入 [01a0ffff]\n说明" }) } },
+    ], page_token: "p2", has_more: true } },
+    { code: 0, data: { items: [{ message_id: "om_root", thread_id: "omt_hit", body: { content: rootText } }], has_more: false } },
+  ];
+  const listCalls: any[] = [];
+  (transport as any).sdkClient = { im: { v1: { message: { list: async (params: any) => { listCalls.push(params); return pages.shift(); } } } } };
+  const found = await transport.findRelayTopicRoot("oc_group", title, 1_759_000_000_000, 1_759_001_200_000);
+  assert.deepEqual(found, { topic: { threadId: "omt_hit", rootMessageId: "om_root" }, complete: true });
+  assert.equal(listCalls[0].params.container_id_type, "chat");
+  assert.equal(listCalls[0].params.container_id, "oc_group");
+  assert.equal(listCalls[0].params.start_time, "1759000000");
+  assert.equal(listCalls[0].params.end_time, "1759001200");
+  assert.equal(listCalls[1].params.page_token, "p2", "翻页必须带上 page_token");
+
+  // 扫完窗口没有命中：可以认定"未创建"
+  (transport as any).sdkClient = { im: { v1: { message: { list: async () => ({ code: 0, data: { items: [], has_more: false } }) } } } };
+  assert.deepEqual(await transport.findRelayTopicRoot("oc_group", title, 0, 1), { complete: true });
+  // 查询本身失败必须抛错：把"查不到"当成"没创建"会漏掉已存在的孤立话题
+  (transport as any).sdkClient = { im: { v1: { message: { list: async () => ({ code: 999, msg: "no permission" }) } } } };
+  await assert.rejects(transport.findRelayTopicRoot("oc_group", title, 0, 1), /历史消息查询失败/);
 });
 
 test("飞书传输：出站媒体先上传再按话题回复，缺标识必须报错", async (t) => {

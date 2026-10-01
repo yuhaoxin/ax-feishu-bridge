@@ -1,4 +1,5 @@
 import { describeMediaFile, type MediaKind } from "../../feishu/media.ts";
+import type { RelayTopicHistory } from "../../feishu/relay-topic.ts";
 
 export type RelayBinding = {
   sessionId: string;
@@ -13,7 +14,16 @@ export type RelayBinding = {
 
 export type RelayTransport = {
   verifyTopicChat(chatId: string, ownerOpenId: string): Promise<void>;
-  createRelayTopic(chatId: string, title: string): Promise<{ threadId: string; rootMessageId: string }>;
+  /**
+   * 以调用方给定的 uuid 创建话题。同一 uuid 在飞书的去重窗口内只会落一条消息，
+   * 因此用同一个 uuid 重放要么补建、要么取回原话题，都不会产生重复话题。
+   */
+  createRelayTopic(chatId: string, title: string, uuid: string): Promise<{ threadId: string; rootMessageId: string }>;
+  /**
+   * 在时间窗口内查找标题匹配的现存话题根消息，用于对账"上次创建到底有没有落下话题"。
+   * 找不到且 `complete` 为 true 时，可以认定该话题没有创建。
+   */
+  findRelayTopicRoot(chatId: string, title: string, fromMs: number, toMs: number): Promise<RelayTopicHistory>;
   replyRelayText(rootMessageId: string, text: string): Promise<void>;
   replyRelayCard(rootMessageId: string, card: object): Promise<string>;
   /** 上传本地媒体并返回平台文件标识（图片 image_key / 文件 file_key）。 */

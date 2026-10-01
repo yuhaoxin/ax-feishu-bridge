@@ -197,6 +197,8 @@ export default function createPiFeishuExtension(
       await transport.start();
       gatewayLock.startHeartbeat();
       await gatewayLock.update("connected");
+      // 上次创建若留下待对账记录，启动即核对：网络故障恢复后不需要人工清理状态文件。
+      await relay.reconcilePendingTopic();
       updateStatus("connected");
       return "started";
     } catch (error) {

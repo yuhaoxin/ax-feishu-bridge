@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { dirname } from "node:path";
@@ -17,6 +17,7 @@ import {
 } from "../../feishu/ask-card.ts";
 import type { FeishuCardAction, FeishuMessage } from "../../feishu/types.ts";
 import { parseMessageInput } from "../../feishu/messages.ts";
+import { RelayTopicCreateError } from "../../feishu/relay-topic.ts";
 import { RelayPeer } from "./relay-rpc.ts";
 import { sendRelayAnswer, sendRelayMedia, type RelayBinding, type RelayTransport } from "./relay-output.ts";
 
@@ -25,12 +26,38 @@ export type RelayState = {
   appId: string;
   /** autobind、echo（本地输入镜像）、exitNotice（退出时的对话关闭提示）缺省均为开。 */
   settings?: { chatId: string; ownerOpenId: string; autobind?: boolean; echo?: boolean; exitNotice?: boolean };
-  pendingTopic?: { sessionId: string; title: string };
+  /**
+   * 话题创建意图：先落盘再调用飞书，创建结果未确认时据此对账，
+   * 避免出现"可能已建了话题"却无人能判定的状态。
+   */
+  pendingTopic?: {
+    sessionId: string;
+    title: string;
+    /** 创建请求的幂等键：同一 uuid 在飞书去重窗口内只落一条消息，重放即可得到确定结果。 */
+    uuid?: string;
+    /** 首次创建尝试的时间（毫秒）；缺省表示旧版本写入，没有时间窗口可依。 */
+    createdAt?: number;
+    /** 建话题时的首条输入：对账成功时用它补齐绑定记录。 */
+    firstInput?: string;
+  };
   bindings: RelayBinding[];
   receipts: Record<string, number>;
   /** 主动退出接力的会话：不再自动绑定；旧话题记录保留以持续拦截。 */
   optOut: string[];
 };
+
+/** 飞书消息去重窗口：同一 uuid 只落一条消息的时间范围。 */
+const TOPIC_UUID_WINDOW_MS = 60 * 60 * 1000;
+/** 历史查询在创建时间前后的余量：补偿时钟偏差与投递延迟。 */
+const TOPIC_SEARCH_BACK_MS = 2 * 60 * 1000;
+const TOPIC_SEARCH_AHEAD_MS = 10 * 60 * 1000;
+/** 旧版状态没有创建时间时的回看范围。 */
+const TOPIC_SEARCH_LEGACY_MS = 7 * 24 * 60 * 60 * 1000;
+/** 两次网络对账的最小间隔：用户连续输入不该反复打飞书接口。 */
+const RECONCILE_THROTTLE_MS = 30_000;
+
+/** 待对账话题的处理结果：pending 表示仍未确认，需要下次再试。 */
+type ReconcileOutcome = "none" | "resolved" | "cleared" | "pending";
 
 /**
  * 一次等待飞书作答的提问。答案在内存里累积：进程重启后卡片上的旧按钮会回「已结束」，
@@ -68,6 +95,8 @@ export class RelayGateway {
   private state: RelayState;
   private control: Promise<unknown> = Promise.resolve();
   private pendingAsks = new Map<string, PendingAsk>();
+  /** 上一次发起网络对账的时间（毫秒）；同一进程内按 RECONCILE_THROTTLE_MS 节流。 */
+  private lastReconcileAt = 0;
 
   constructor(
     private readonly statePath: string,
@@ -90,6 +119,11 @@ export class RelayGateway {
       if (![binding.sessionId, binding.chatId, binding.threadId, binding.rootMessageId, binding.title, binding.firstInput].every((s) => typeof s === "string" && s.length) || typeof binding.enabled !== "boolean") {
         throw new Error("接力绑定数据损坏；为避免消息进入错误会话，已停止接力服务。");
       }
+    }
+    // 待对账记录损坏时不能猜：宁可拒绝启动，也不要在标题或会话不明的情况下重放创建。
+    const pending = this.state.pendingTopic;
+    if (pending && (typeof pending.sessionId !== "string" || !pending.sessionId || typeof pending.title !== "string" || !pending.title)) {
+      throw new Error("接力状态中的待对账话题记录损坏；为避免重复建话题，已停止接力服务。");
     }
   }
 
@@ -234,13 +268,96 @@ export class RelayGateway {
 
   /** register/ping/status 统一返回绑定与全局开关：终端据此决定是否镜像本地输入、退出时是否推送关闭提示。 */
   private relayView(sessionId: string) {
+    const pending = this.state.pendingTopic;
     return {
       binding: this.binding(sessionId),
       echo: this.state.settings?.echo !== false,
       exitNotice: this.state.settings?.exitNotice !== false,
+      autobind: this.state.settings?.autobind !== false,
+      optedOut: this.state.optOut.includes(sessionId),
+      // 待对账的创建意图：终端据此区分"下条输入会建话题"与"创建卡在对账中"。
+      pendingTopic: pending ? { title: pending.title, mine: pending.sessionId === sessionId } : undefined,
     };
   }
   private save() { writeRelayJson(this.statePath, this.state); }
+
+  /** 落盘并切换绑定集合：写绑定与清待对账必须同一次写入，避免中间态被进程崩溃留下。 */
+  private commitBinding(binding: RelayBinding) {
+    const next = { ...this.state, bindings: [...this.state.bindings, binding] };
+    delete next.pendingTopic;
+    writeRelayJson(this.statePath, next);
+    this.state = next;
+  }
+
+  private clearPendingTopic() {
+    if (!this.state.pendingTopic) return;
+    const next = { ...this.state };
+    delete next.pendingTopic;
+    writeRelayJson(this.statePath, next);
+    this.state = next;
+  }
+
+  /**
+   * 把待对账的话题创建意图变成确定状态：
+   * - 去重窗口内：用同一 uuid 重放创建。飞书对同一 uuid 只落一条消息，因此重放要么补建、
+   *   要么取回原话题，两种结果都是可用的绑定，不会产生重复话题。
+   * - 窗口外：在群里按时间窗口找标题一致的根消息；扫完窗口仍没有，才能认定创建没有落地。
+   * - 已退出接力的会话只用历史查询认领既有话题，绝不新建。
+   * 网络仍不可用、窗口未扫完或仍在节流窗口内时返回 "pending"，保留记录等下次调用重试。
+   */
+  async reconcilePendingTopic(): Promise<ReconcileOutcome> {
+    const pending = this.state.pendingTopic;
+    if (!pending) return "none";
+    if (this.lastReconcileAt && Date.now() - this.lastReconcileAt < RECONCILE_THROTTLE_MS) return "pending";
+    this.lastReconcileAt = Date.now();
+    const chatId = this.state.settings?.chatId;
+    if (!chatId) return "pending";
+    // 用户已主动退出接力：只认领已存在的话题用于拦截，不因残留的创建意图再建新话题。
+    const allowCreate = !this.state.optOut.includes(pending.sessionId);
+    try {
+      if (allowCreate && pending.uuid && Date.now() - (pending.createdAt ?? 0) < TOPIC_UUID_WINDOW_MS) {
+        const topic = await this.transport.createRelayTopic(chatId, pending.title, pending.uuid);
+        this.adoptPendingTopic(pending, topic, true);
+        return "resolved";
+      }
+      const createdAt = pending.createdAt ?? Date.now() - TOPIC_SEARCH_LEGACY_MS;
+      const history = await this.transport.findRelayTopicRoot(chatId, pending.title, createdAt - TOPIC_SEARCH_BACK_MS, createdAt + TOPIC_SEARCH_AHEAD_MS);
+      if (history.topic) {
+        this.adoptPendingTopic(pending, history.topic, allowCreate);
+        return "resolved";
+      }
+      // 窗口内扫完也没有这个话题：创建确实没有落地，清掉占位让下一次输入正常新建。
+      if (history.complete) {
+        debugLog("feishu.relay.topic.cleared", { sessionId: pending.sessionId, title: pending.title });
+        this.clearPendingTopic();
+        return "cleared";
+      }
+      debugLog("feishu.relay.topic.reconcile_incomplete", { sessionId: pending.sessionId, title: pending.title });
+      return "pending";
+    } catch (error) {
+      // 服务端明确拒绝、或请求根本没送出去：创建没有落地，占位可以直接清掉。
+      if (error instanceof RelayTopicCreateError && error.certainNotCreated) {
+        debugLog("feishu.relay.topic.cleared", { sessionId: pending.sessionId, reason: error.message });
+        this.clearPendingTopic();
+        return "cleared";
+      }
+      debugLog("feishu.relay.topic.reconcile_failed", { sessionId: pending.sessionId, reason: error instanceof Error ? error.message : String(error) });
+      return "pending";
+    }
+  }
+
+  private adoptPendingTopic(pending: NonNullable<RelayState["pendingTopic"]>, topic: { threadId: string; rootMessageId: string }, enabled: boolean) {
+    const chatId = this.state.settings!.chatId;
+    this.commitBinding({
+      sessionId: pending.sessionId,
+      chatId,
+      title: pending.title,
+      firstInput: pending.firstInput || "未命名",
+      enabled,
+      ...topic,
+    });
+    debugLog("feishu.relay.topic.adopted", { sessionId: pending.sessionId, threadId: topic.threadId, enabled });
+  }
 
   private async command(sessionId: string, method: string, params: any) {
     if (method === "configure") {
@@ -281,19 +398,32 @@ export class RelayGateway {
       if (this.state.settings.autobind === false) return { created: false, reason: "disabled" };
       if (binding?.enabled) return { created: true, binding };
       if (this.state.optOut.includes(sessionId)) return { created: false, reason: "opted-out" };
-      if (this.state.pendingTopic) throw new Error("上次话题创建结果未确认，已暂停创建及目标群的普通会话分派。请检查 relay-state.pi.json 中的 pendingTopic，不要反复重试。");
+      // 上次创建结果未确认时先对账：把"可能已创建"变成确定状态，再决定要不要新建。
+      if (this.state.pendingTopic && (await this.reconcilePendingTopic()) === "pending") {
+        throw new Error("上次话题创建结果尚未确认，已暂停创建并自动对账；本次不新建话题，请稍后重试（细节见网关日志）。");
+      }
       // firstInput 先校验：参数不合格时不能留下 pendingTopic 把后续创建全部阻断。
       const title = `${requireString(params?.title, 120)} [${sessionId.slice(0, 8)}]`;
       const firstInput = requireString(params?.firstInput, 200);
       const { chatId } = this.state.settings;
-      this.state.pendingTopic = { sessionId, title };
+      const uuid = randomUUID();
+      this.state.pendingTopic = { sessionId, title, uuid, createdAt: Date.now(), firstInput };
       this.save();
-      const topic = await this.transport.createRelayTopic(chatId, title);
+      let topic: { threadId: string; rootMessageId: string };
+      try {
+        topic = await this.transport.createRelayTopic(chatId, title, uuid);
+      } catch (error) {
+        // 确定没送达的失败留在待对账状态只会阻断后续创建，直接清掉，等下一次输入重建。
+        if (error instanceof RelayTopicCreateError && error.certainNotCreated) {
+          debugLog("feishu.relay.topic.cleared", { sessionId, reason: error.message });
+          this.clearPendingTopic();
+        } else {
+          debugLog("feishu.relay.topic.unresolved", { sessionId, reason: error instanceof Error ? error.message : String(error) });
+        }
+        throw error;
+      }
       const created = { sessionId, chatId, title, firstInput, enabled: true, ...topic };
-      const next = { ...this.state, bindings: [...this.state.bindings, created] };
-      delete next.pendingTopic;
-      writeRelayJson(this.statePath, next);
-      this.state = next;
+      this.commitBinding(created);
       return { created: true, binding: created };
     }
     if (method === "rename") {

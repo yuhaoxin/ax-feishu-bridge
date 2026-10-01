@@ -6,12 +6,15 @@ import { createConnection } from "node:net";
 import { once } from "node:events";
 import test from "node:test";
 import { RelayGateway } from "../src/adapters/pi/relay-gateway.ts";
+import { RelayTopicCreateError } from "../src/feishu/relay-topic.ts";
 import { RelayClient } from "../src/adapters/pi/relay-client.ts";
 import type { RelayTransport } from "../src/adapters/pi/relay-output.ts";
 import type { FeishuMessage } from "../src/feishu/types.ts";
 
 export function fakeTransport() {
   const topics: string[] = [];
+  const topicUuids: string[] = [];
+  const history: Array<{ chat: string; title: string; from: number; to: number }> = [];
   const renames: Array<{ root: string; title: string }> = [];
   const text: Array<{ root: string; text: string }> = [];
   const cards: Array<{ root: string; card: any }> = [];
@@ -19,9 +22,14 @@ export function fakeTransport() {
   const media: Array<{ root: string; kind: string; key: string }> = [];
   const transport: RelayTransport = {
     async verifyTopicChat(chat, owner) { assert.equal(chat, "oc_test"); assert.equal(owner, "ou_owner"); },
-    async createRelayTopic(_chat, title) {
+    async createRelayTopic(_chat, title, uuid) {
       topics.push(title);
+      topicUuids.push(uuid);
       return { threadId: `omt_${topics.length}`, rootMessageId: `om_${topics.length}` };
+    },
+    async findRelayTopicRoot(chat, title, from, to) {
+      history.push({ chat, title, from, to });
+      return { complete: true };
     },
     async replyRelayText(root, value) { text.push({ root, text: value }); },
     async replyRelayCard(root, card) { cards.push({ root, card }); return `om_card${cards.length}`; },
@@ -30,18 +38,26 @@ export function fakeTransport() {
     async updateRelayCard() {},
     async renameRelayTitle(root, title) { renames.push({ root, title }); },
   };
-  return { topics, renames, text, cards, uploads, media, transport };
+  return { topics, topicUuids, history, renames, text, cards, uploads, media, transport };
 }
 
 function incoming(threadId: string, messageId: string, senderOpenId = "ou_owner"): FeishuMessage {
   return { chatId: "oc_test", chatType: "group", threadId, messageId, senderOpenId, msgType: "text", content: JSON.stringify({ text: "继续任务" }) };
 }
 
-async function fixture(t: any) {
+/** 预置状态：网关构造时读取，因此必须在 new RelayGateway 之前写盘。 */
+const relayState = (extra: Record<string, unknown>) => ({
+  version: 2, appId: "app_test", bindings: [], receipts: {}, optOut: [],
+  settings: { chatId: "oc_test", ownerOpenId: "ou_owner" },
+  ...extra,
+});
+
+async function fixture(t: any, options: { state?: unknown } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "pi-relay-test-"));
   const state = join(dir, "state.json");
   const endpoint = join(dir, "endpoint.json");
   const fake = fakeTransport();
+  if (options.state) writeFileSync(state, JSON.stringify(options.state));
   const gateway = new RelayGateway(state, endpoint, "app_test", fake.transport);
   await gateway.start();
   const clients: RelayClient[] = [];
@@ -193,15 +209,94 @@ test("接力：出站媒体按本地校验上传后回到同一话题", async (t
   assert.equal(f.uploads.length, before, "校验失败不能产生上传");
 });
 
-test("接力：话题创建超时后持久阻断重试及普通后台回落", async (t) => {
+test("接力：结果不确定保留待对账记录，重放复用同一幂等键", async (t) => {
   const f = await fixture(t);
   let creates = 0;
-  f.transport.createRelayTopic = async () => { creates++; throw new Error("远端创建结果未确认"); };
+  f.transport.createRelayTopic = async (_chat, _title, uuid) => { creates++; f.topicUuids.push(uuid); throw new Error("远端创建结果未确认"); };
   await assert.rejects(f.a.request("autobindTopic", { title: "不确定话题", firstInput: "重试输入" }), /未确认/);
-  await assert.rejects(f.a.request("autobindTopic", { title: "再次尝试", firstInput: "再次尝试" }), /暂停创建/);
-  assert.equal(creates, 1);
+  const pending = JSON.parse(readFileSync(f.state, "utf8")).pendingTopic;
+  assert.equal(pending.sessionId, "session-a");
+  assert.ok(pending.uuid && pending.createdAt, "待对账记录必须带幂等键与时间");
+  // 第二次输入先对账：用同一 uuid 重放，因此即便创建真的落过话题也不会重复建
+  await assert.rejects(f.a.request("autobindTopic", { title: "再次尝试", firstInput: "再次尝试" }), /暂停创建并自动对账/);
+  assert.equal(creates, 2);
+  assert.equal(f.topicUuids[1], f.topicUuids[0], "重放必须复用第一次的 uuid");
+  // 对账失败后短时间内不再重复打飞书，用户连续输入不会变成接口风暴
+  await assert.rejects(f.a.request("autobindTopic", { title: "第三次", firstInput: "第三次" }), /暂停创建/);
+  assert.equal(creates, 2);
   assert.equal(await f.gateway.handleMessage(incoming("omt_unknown", "orphan")), true);
-  assert.equal(JSON.parse(readFileSync(f.state, "utf8")).pendingTopic.sessionId, "session-a");
+});
+
+test("接力：确定未送达的失败清掉待对账记录，下一次输入正常建话题", async (t) => {
+  const f = await fixture(t);
+  let unreachable = true;
+  const create = f.transport.createRelayTopic;
+  f.transport.createRelayTopic = async (chat, title, uuid) => {
+    if (unreachable) throw new RelayTopicCreateError("DNS 解析失败", { certainNotCreated: true });
+    return create(chat, title, uuid);
+  };
+  await assert.rejects(f.a.request("autobindTopic", { title: "断网话题", firstInput: "断网输入" }), /DNS 解析失败/);
+  // 请求确定没送达：留着占位只会阻断后续创建，必须直接清掉
+  assert.equal(JSON.parse(readFileSync(f.state, "utf8")).pendingTopic, undefined);
+  unreachable = false;
+  const created = await f.a.request("autobindTopic", { title: "恢复话题", firstInput: "恢复输入" });
+  assert.equal(created.created, true);
+  assert.equal(created.binding.title, "恢复话题 [session-]");
+});
+
+test("接力：超出去重窗口后按历史对账，命中则收养", async (t) => {
+  const f = await fixture(t, {
+    state: relayState({
+      pendingTopic: { sessionId: "session-a", title: "旧话题 [session-]", uuid: "u-old", createdAt: Date.now() - 2 * 60 * 60 * 1000, firstInput: "旧输入" },
+    }),
+  });
+  f.transport.findRelayTopicRoot = async (chat, title, from, to) => {
+    f.history.push({ chat, title, from, to });
+    return { topic: { threadId: "omt_adopted", rootMessageId: "om_adopted" }, complete: true };
+  };
+  assert.equal(await f.gateway.reconcilePendingTopic(), "resolved");
+  const saved = JSON.parse(readFileSync(f.state, "utf8"));
+  assert.equal(saved.pendingTopic, undefined);
+  assert.deepEqual(saved.bindings, [{
+    sessionId: "session-a", chatId: "oc_test", title: "旧话题 [session-]", firstInput: "旧输入",
+    enabled: true, threadId: "omt_adopted", rootMessageId: "om_adopted",
+  }]);
+  assert.equal(f.topics.length, 0, "去重窗口已过，不能靠重放创建");
+  assert.equal(f.history.length, 1);
+  // 收养后该话题的消息能路由回原会话，而不是回落到后台会话
+  assert.equal(await f.gateway.handleMessage(incoming("omt_adopted", "msg-1")), true);
+});
+
+test("接力：窗口内扫完仍没有该话题时清除记录，窗口没扫完时不下结论", async (t) => {
+  const pending = { sessionId: "session-a", title: "没建成 [session-]", uuid: "u-missing", createdAt: Date.now() - 2 * 60 * 60 * 1000, firstInput: "输入" };
+  const f = await fixture(t, { state: relayState({ pendingTopic: pending }) });
+  // 扫完整个窗口也没有这个话题：创建确实没落地，清掉占位等下一次输入重建
+  assert.equal(await f.gateway.reconcilePendingTopic(), "cleared");
+  assert.equal(JSON.parse(readFileSync(f.state, "utf8")).pendingTopic, undefined);
+  const created = await f.a.request("autobindTopic", { title: "重建话题", firstInput: "重建输入" });
+  assert.equal(created.created, true);
+
+  // 历史没扫完时不能清记录，否则可能留下无人认领的孤立话题
+  const g = await fixture(t, { state: relayState({ pendingTopic: pending }) });
+  g.transport.findRelayTopicRoot = async () => ({ complete: false });
+  assert.equal(await g.gateway.reconcilePendingTopic(), "pending");
+  assert.ok(JSON.parse(readFileSync(g.state, "utf8")).pendingTopic);
+  assert.equal(await g.gateway.reconcilePendingTopic(), "pending", "节流窗口内不重复对账");
+  assert.equal(g.history.length, 0);
+});
+
+test("接力：已退出接力的会话只用历史认领话题，不重放创建", async (t) => {
+  const f = await fixture(t, {
+    state: relayState({
+      optOut: ["session-a"],
+      pendingTopic: { sessionId: "session-a", title: "退出后残留 [session-]", uuid: "u-quit", createdAt: Date.now(), firstInput: "输入" },
+    }),
+  });
+  f.transport.findRelayTopicRoot = async () => ({ topic: { threadId: "omt_kept", rootMessageId: "om_kept" }, complete: true });
+  assert.equal(await f.gateway.reconcilePendingTopic(), "resolved");
+  const binding = JSON.parse(readFileSync(f.state, "utf8")).bindings[0];
+  assert.equal(binding.enabled, false, "认领的话题只用于拦截，不恢复接力");
+  assert.equal(f.topics.length, 0, "已退出的会话不能新建话题");
 });
 
 test("接力：网关重启恢复路由和收讫记录，不恢复旧连接", async (t) => {

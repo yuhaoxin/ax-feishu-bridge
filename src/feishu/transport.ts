@@ -9,6 +9,15 @@ import {
 } from "./group-trigger.ts";
 import { buildMarkdownCardParts, buildPostMessages, chooseMessageMode } from "./rich-text.ts";
 import { withRetry } from "./retry.ts";
+import {
+  RelayTopicCreateError,
+  failureText,
+  firstMessageOf,
+  isPreSendFailure,
+  matchRelayTopicRoot,
+  parseMessageListPage,
+  type RelayTopicHistory,
+} from "./relay-topic.ts";
 import { extractTextFromMsgType } from "./interactive-card.ts";
 import { FeishuCardActionWebhook } from "./card-action-webhook.ts";
 
@@ -401,15 +410,69 @@ export class FeishuTransport {
     if (data.owner_id !== ownerOpenId) throw new Error("接力授权账号必须是该话题群的群主，请核对你的 open_id。");
   }
 
-  async createRelayTopic(chatId: string, title: string) {
+  /**
+   * 话题创建。uuid 由调用方持有并落盘：同一 uuid 在飞书去重窗口内只落一条消息，
+   * 重放因此能给出确定结果，调用方不必靠"可能已创建"的猜测决定是否重试。
+   */
+  async createRelayTopic(chatId: string, title: string, uuid: string) {
     const result = await this.sdkClient.im.message.create({
       params: { receive_id_type: "chat_id" },
-      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: relayRootText(title) }), uuid: randomUUID() },
+      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: relayRootText(title) }), uuid },
+    }).catch((error: unknown) => {
+      // 请求在传输层失败：只有能证明没离开本机的错误才允许当成"未创建"。
+      throw new RelayTopicCreateError(failureText(error), { certainNotCreated: isPreSendFailure(error) });
     });
-    const data = this.relayResult(result);
-    if (!data.message_id || !data.thread_id) throw new Error("飞书未返回完整话题标识，话题可能已创建但未绑定；请检查飞书后再操作。");
-    this.rememberBotOutboundMessageId(data.message_id);
-    return { threadId: String(data.thread_id), rootMessageId: String(data.message_id) };
+    // HTTP 成功但业务码非 0：服务端明确拒绝，消息没有创建，调用方可以随后正常重建。
+    if (result?.code !== 0 || !result?.data) {
+      throw new RelayTopicCreateError(`飞书接力请求未确认成功（错误码 ${result?.code ?? "未知"}），请检查飞书后再操作。`, { certainNotCreated: true });
+    }
+    const data: { message_id?: string; thread_id?: string } = result.data;
+    if (!data.message_id) throw new RelayTopicCreateError("飞书未返回消息标识，投递结果未确认；请检查飞书。", { certainNotCreated: false });
+    // 话题标识缺失时补查一次单条消息：消息已经创建，能救回 thread_id 就不必留给调用方人工处理。
+    const threadId = data.thread_id || (await this.fetchMessageThreadId(String(data.message_id)));
+    if (!threadId) throw new RelayTopicCreateError("飞书未返回话题标识，话题已创建但未绑定；请检查飞书后再操作。", { certainNotCreated: false });
+    this.rememberBotOutboundMessageId(String(data.message_id));
+    return { threadId: String(threadId), rootMessageId: String(data.message_id) };
+  }
+
+  async findRelayTopicRoot(chatId: string, title: string, fromMs: number, toMs: number): Promise<RelayTopicHistory> {
+    const maxPages = 6;
+    let pageToken: string | undefined;
+    for (let attempt = 0; attempt < maxPages; attempt++) {
+      const result = await this.apiCall<unknown>("feishu.relay.topic_search", () => this.sdkClient.im.v1.message.list({
+        params: {
+          container_id_type: "chat",
+          container_id: chatId,
+          start_time: String(Math.floor(fromMs / 1000)),
+          end_time: String(Math.floor(toMs / 1000)),
+          sort_type: "ByCreateTimeAsc",
+          page_size: 50,
+          ...(pageToken ? { page_token: pageToken } : {}),
+        },
+      }));
+      const page = parseMessageListPage(result);
+      for (const item of page.items) {
+        const topic = matchRelayTopicRoot(item, title);
+        if (topic) return { topic, complete: true };
+      }
+      pageToken = page.pageToken;
+      if (!page.hasMore || !pageToken) return { complete: true };
+    }
+    return { complete: false };
+  }
+
+  /** 单条消息的 thread_id：创建响应缺话题标识时用它补齐，失败按不确定处理。 */
+  private async fetchMessageThreadId(messageId: string): Promise<string | undefined> {
+    try {
+      const result = await this.apiCall<unknown>("feishu.relay.topic_thread", () =>
+        this.sdkClient.im.message.get({ path: { message_id: messageId } }),
+      );
+      const item = firstMessageOf(result);
+      return typeof item?.thread_id === "string" && item.thread_id ? item.thread_id : undefined;
+    } catch (error) {
+      debugLog("feishu.relay.topic_thread.error", { messageId, error: failureText(error) });
+      return undefined;
+    }
   }
 
   async replyRelayText(rootMessageId: string, text: string) {
